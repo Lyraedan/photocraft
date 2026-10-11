@@ -32,8 +32,15 @@
 	New from Clipboard	Nuevo desde el portapapeles
 	Open…	Abrir…
 	Open As…	Abrir como…
+	Open EXR Parts…	Abrir partes EXR…
+	Add beauty precomp from the AOVs	Añadir la precomposición de belleza a partir de los AOV
+	Both	Ambas
+	Left	Izquierda
+	Right	Derecha
 	Open Recent	Archivos recientes
 	Clear Recent Files	Vaciar archivos recientes
+	Remove from Recent	Quitar de recientes
+	Remove {name} from Recent	Quitar {name} de recientes
 	Close	Cerrar
 	Minimize	Minimizar
 	Maximize	Maximizar
@@ -81,6 +88,8 @@
 	Import	Importar
 	Browse…	Examinar…
 	Reveal in Finder	Mostrar en Finder
+	Show in Explorer	Mostrar en el Explorador
+	Show in Folder	Mostrar en la carpeta
 	File Info…	Información del archivo…
 	Print…	Imprimir…
 	Print One Copy	Imprimir un ejemplar
@@ -256,6 +265,8 @@
 	Layer via Cut	Capa vía corte
 	Layer From Background…	Capa a partir del fondo…
 	Layer from Background…	Capa a partir del fondo…
+	Background from Layer	Fondo a partir de capa
+	Background From Layer	Fondo a partir de capa
 	New Shape Layer	Nueva capa de forma
 	New Type Layer	Nueva capa de texto
 	New Fill Layer	Nueva capa de relleno
@@ -583,6 +594,10 @@
 	100%	100%
 	200%	200%
 	75%	75%
+	80%	80%
+	85%	85%
+	90%	90%
+	95%	95%
 	125%	125%
 	150%	150%
 	175%	175%
@@ -675,6 +690,10 @@
 	Classic Theme	Tema Clásico
 	Solarized dark	Solarized oscuro
 	Solarized Dark Theme	Tema Solarized oscuro
+	Breeze dark	Breeze oscuro
+	Breeze Dark Theme	Tema Breeze oscuro
+	Breeze light	Breeze claro
+	Breeze Light Theme	Tema Breeze claro
 	Next Theme	Tema siguiente
 	Actions	Acciones
 	Brush Settings	Ajustes del pincel
@@ -808,7 +827,6 @@
 	Blending Options	Opciones de fusión
 	Blue	Azul
 	Blue, Red, Yellow	Azul, rojo, amarillo
-	Both	Ambos
 	Both Axes	Ambos ejes
 	Bottom	Inferior
 	Brightness	Brillo
@@ -1127,7 +1145,6 @@
 	Leading	Interlínea
 	Leading (set to the font size × auto-leading when Auto)	Interlínea (al estar en Automático se iguala al tamaño de fuente × interlínea automática)
 	Leave as is (don't color manage)	Dejar como está (no gestionar el color)
-	Left	Izquierda
 	Left align text	Alinear texto a la izquierda
 	Length:	Longitud:
 	Level	Nivel
@@ -1299,6 +1316,7 @@
 	Record ● a sequence of edits, then play ▶ it on any document.	Graba ● una secuencia de ediciones y reprodúcela ▶ en cualquier documento.
 	Red	Rojo
 	Redefine style by current selection	Redefinir el estilo con la selección actual
+	Refine	Refinar
 	Reflected Gradient	Degradado reflejado
 	Registration Marks	Marcas de registro
 	Regular	Normal
@@ -1337,7 +1355,6 @@
 	Restore All	Restaurar todo
 	Restore Defaults	Restaurar valores predeterminados
 	Restrictive (Web)	Restrictivo (web)
-	Right	Derecha
 	Right align text	Alinear texto a la derecha
 	Rigid	Rígido
 	Rotate:	Rotación:
@@ -1521,6 +1538,7 @@
 	Blur Tool	Herramienta Desenfocar
 	Bold	Negrita
 	Brush	Pincel
+	Block	Bloque
 	Brush Pose	Postura del pincel
 	Brush Tip Shape	Forma de la punta del pincel
 	Brush Tool	Herramienta Pincel
@@ -1570,6 +1588,8 @@
 	Efficiency: 100%	Eficiencia: 100%
 	Ellipse Tool	Herramienta Elipse
 	Elliptical Marquee Tool	Herramienta Marco elíptico
+	Single Row Marquee Tool	Herramienta Marco de fila única
+	Single Column Marquee Tool	Herramienta Marco de columna única
 	Emboss	Relieve
 	Eraser	Borrador
 	Eraser Tool	Herramienta Borrador
@@ -1627,6 +1647,7 @@
 	Mobile	Móvil
 	Move Tool	Herramienta Mover
 	Could not use the move tool because the layer is locked.	No se pudo usar la herramienta Mover porque la capa está bloqueada.
+	Could not complete the Free Transform command because the layer is locked.	No se pudo completar el comando Transformación libre porque la capa está bloqueada.
 	Multiply	Multiplicar
 	My Brushes	Mis pinceles
 	Neutrals	Neutros
@@ -1737,6 +1758,7 @@
 	Invalid {mode} profile	Perfil {mode} no válido
 	Unnamed {mode} profile	Perfil {mode} sin nombre
 	{w} px x {h} px ({ppi} ppi)	{w} px × {h} px ({ppi} ppi)
+	{w} {unit} x {h} {unit} ({ppi} ppi)	{w} {unit} × {h} {unit} ({ppi} ppi)
 	Resolution: {dpi} pixels/inch	Resolución: {dpi} píxeles/pulgada
 	Doc: {w} × {h} px	Doc: {w} × {h} px
 	Frame {current} / {total}	Fotograma {current} / {total}
@@ -1889,6 +1911,7 @@
 	Show only crosshair while painting	Mostrar solo la retícula al pintar
 	Show slice numbers	Mostrar los números de sección
 	Show tooltips	Mostrar las descripciones emergentes
+	Show highlight on rollover	Mostrar resaltado al pasar el cursor
 	Show bounding box when dragging layer	Mostrar el cuadro delimitador al arrastrar la capa
 	System title bar	Barra de título del sistema
 	Show transformation values	Mostrar los valores de transformación
@@ -1996,6 +2019,7 @@
 	Create Warped Text	Crear texto deformado
 	Rasterize Smart Object	Rasterizar objeto inteligente
 	Rasterize Fill Content	Rasterizar contenido de relleno
+	Rasterize Layer Style	Rasterizar estilo de capa
 	Unlock: picking a preset replaces these settings	Desbloquear: al elegir un preajuste se reemplazan estos ajustes
 	Lock: keep these settings when picking another preset	Bloquear: conservar estos ajustes al elegir otro preajuste
 	Diameter:	Diámetro:
@@ -2293,6 +2317,7 @@ cameraRaw	Amount	Cantidad
 
 # Shared screen eyedropper and text Color Picker (#1128).
 	Color Picker (Text Color)	Selector de color (Color del texto)
+	Color Picker ({name})	Selector de color ({name})
 	Color Picker (Fill Color)	Selector de color (Color de relleno)
 	Fill color	Color de relleno
 	Color Picker (Stroke Color)	Selector de color (Color del trazo)
@@ -2392,6 +2417,7 @@ fontWeight	Italic	Cursiva
 	Color to Alpha…	Color a alfa…
 	Transparency Threshold	Umbral de transparencia
 	Opacity Threshold	Umbral de opacidad
+	PhotoCraft — Screen Color Picker	PhotoCraft — Selector de color de pantalla
 
 	Rasterize svg groups deeper than	Rasterizar grupos SVG con mayor profundidad
 	0 turns this threshold off; SVG groups nested deeper than 100 levels are always rasterized.	0 desactiva este umbral; los grupos SVG anidados a más de 100 niveles siempre se rasterizan.
@@ -2474,3 +2500,23 @@ fontWeight	Italic	Cursiva
 	Quick Selection found nothing there	Selección rápida no encontró nada ahí
 	Object Selection found nothing there — try a tighter rectangle	Selección de objeto no encontró nada ahí — pruebe un rectángulo más ajustado
 	No subject found — try a rectangle around the object	No se encontró ningún sujeto — pruebe un rectángulo alrededor del objeto
+
+# Add Noise, Reduce Noise and Smart Sharpen dialog controls (Filter > Noise, Filter > Sharpen).
+	Distribution	Distribución
+	Uniform	Uniforme
+	Gaussian	Gaussiana
+	Monochromatic	Monocromático
+	Seed	Semilla
+	Strength	Intensidad
+	Reduce Color Noise	Reducir ruido de color
+	Remove Jpeg Artifact	Quitar artefactos JPEG
+	Sharpen Details	Enfocar detalles
+	Reduce Noise	Reducir ruido
+	Use Classic Mode	Usar modo clásico
+	Auto Center Preview	Centrar previsualización automáticamente
+	Next Document	Documento siguiente
+	Previous Document	Documento anterior
+	W x H x Resolution	An. x Al. x Resolución
+	Front Image	Imagen frontal
+	Search settings…	Buscar ajustes…
+	No matching settings	No hay ajustes que coincidan
