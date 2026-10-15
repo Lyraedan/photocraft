@@ -616,6 +616,9 @@ pub struct PhotocraftApp {
     /// The first digit of a two-digit opacity typed on the number keys (`opacity_keys`, #352).
     pub(crate) opacity_keys: opacity_keys::Pending,
     control_rx: Option<Receiver<ControlRequest>>,
+    /// Cooperative-working events from the `netcode` transport thread (see `netcode` in the
+    /// desktop app). `None` in tests, the web build and headless sessions.
+    collab_rx: Option<Receiver<photocraft_engine::collab::CollabEvent>>,
     pending_screenshots: Vec<(u64, Option<String>, Sender<ControlResponse>)>,
     /// Screenshots not yet requested from the viewport: (token, earliest time in ms, frames seen).
     queued_screenshots: Vec<(u64, f64, u32)>,
@@ -849,6 +852,7 @@ impl PhotocraftApp {
             caps_lock: false,
             opacity_keys: None,
             control_rx: None,
+            collab_rx: None,
             pending_screenshots: Vec::new(),
             queued_screenshots: Vec::new(),
             input_waiters: Vec::new(),
@@ -1001,6 +1005,12 @@ impl PhotocraftApp {
     /// Attach a control channel (requests arrive from a transport thread: TCP, stdin, tests).
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
         self.control_rx = Some(rx);
+        self
+    }
+
+    /// Attach the cooperative-working event channel (the desktop app's `netcode` transport).
+    pub fn with_collab(mut self, rx: Receiver<photocraft_engine::collab::CollabEvent>) -> Self {
+        self.collab_rx = Some(rx);
         self
     }
 
@@ -1719,6 +1729,20 @@ impl PhotocraftApp {
         self.control_rx = Some(rx);
     }
 
+    /// Apply cooperative-working events the transport thread queued since the last frame.
+    fn drain_collab(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.collab_rx.take() else { return };
+        let mut any = false;
+        while let Ok(ev) = rx.try_recv() {
+            self.session.collab_receive(ev);
+            any = true;
+        }
+        self.collab_rx = Some(rx);
+        if any {
+            ctx.request_repaint();
+        }
+    }
+
     fn issue_screenshots(&mut self, ctx: &egui::Context) {
         let now = gpu_canvas::now_ms();
         self.queued_screenshots.retain_mut(|(token, at, frames)| {
@@ -1793,6 +1817,7 @@ impl eframe::App for PhotocraftApp {
             self.checker = None;
         }
         self.drain_control(ctx);
+        self.drain_collab(ctx);
         native_menu::run(self, ctx);
         // Switching tools commits, also between the Type and Type Mask tools.
         if self.ui.text_edit.as_ref().is_some_and(|ed| !self.ui.tool.is_type() || ed.mask != self.ui.tool.is_type_mask()) {

@@ -11,3 +11,6 @@ target/
 /craft-fonts
 *.log
 __pycache__/
+
+# Cooperative-working build output (CARGO_TARGET_DIR=Build)
+/Build

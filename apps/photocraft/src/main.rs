@@ -43,6 +43,8 @@ mod mac_window;
 mod linux_libs;
 mod logging;
 mod monitor_profile;
+// Cooperative-working transport: every socket, frame and handshake for shared sessions.
+mod netcode;
 mod photoshop_settings;
 mod screen_color;
 mod services;
@@ -473,6 +475,11 @@ fn main() -> eframe::Result {
                 let rx = control_server::start(port, token, cc.egui_ctx.clone());
                 app = app.with_control(rx);
             }
+            // Cooperative working: start the transport thread and attach it. Idle until a
+            // `collab.host` / `collab.join` command arrives.
+            let (collab_link, collab_rx) = netcode::start();
+            app.session.collab_install_link(Box::new(collab_link));
+            app = app.with_collab(collab_rx);
             #[cfg(target_os = "macos")]
             {
                 app.services.os_events = Some(apple_events.connect(&cc.egui_ctx));

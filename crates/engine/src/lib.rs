@@ -26,6 +26,8 @@ mod canvas_geom;
 mod channel_clip;
 pub mod channel_cmds;
 mod clip_group;
+pub mod collab;
+pub mod collab_cmds;
 pub mod color_cmds;
 pub mod color_to_alpha_cmds;
 pub mod commands;
@@ -482,6 +484,12 @@ pub struct Session {
     /// document, source read-only)`. The shell takes them with [`Session::take_held_open`].
     held_opens: Vec<(u64, Document, bool)>,
     next_held_open: u64,
+    /// Cooperative working: the shared session this app is hosting or joined to (see `collab`).
+    pub collab: collab::CollabState,
+    /// The transport the desktop app injects for [`Session::collab_request`]. `None` in headless
+    /// sessions, the web build and tests, where `collab.host` / `collab.join` report that
+    /// collaboration is unavailable.
+    pub collab_link: Option<Box<dyn collab::CollabLink>>,
 }
 
 /// Move item `i` of `v` to position `to`, clamped to the end. Returns where it went; `None` when
@@ -642,6 +650,60 @@ impl Session {
     /// Withdraw an offer the command didn't take.
     pub fn clear_live_stroke(&mut self) {
         self.live_commit = None;
+    }
+
+    /// Install the cooperative-working transport. The desktop app calls this once at launch;
+    /// headless sessions leave it unset (`collab.*` then reports collaboration is unavailable).
+    pub fn collab_install_link(&mut self, link: Box<dyn collab::CollabLink>) {
+        self.collab_link = Some(link);
+    }
+
+    /// Hand a request to the transport thread. `Err` when no transport is installed.
+    pub fn collab_request(&self, req: collab::CollabRequest) -> Result<()> {
+        let link = self.collab_link.as_ref().ok_or_else(|| EngineError::Other("collaboration is not available in this build".into()))?;
+        link.request(req);
+        Ok(())
+    }
+
+    /// Apply an event from the transport thread. The app drains these each frame and forwards
+    /// them here; nothing else mutates [`CollabState`](collab::CollabState).
+    pub fn collab_receive(&mut self, ev: collab::CollabEvent) {
+        use collab::CollabEvent;
+        match ev {
+            CollabEvent::Hosting { addr } => {
+                self.collab.role = collab::CollabRole::Host { addr };
+                self.collab.error = None;
+            }
+            CollabEvent::Joined { self_info, session } => {
+                self.collab.self_id = self_info.id;
+                self.collab.session = session;
+                if !self.collab.peers.iter().any(|p| p.id == self_info.id) {
+                    self.collab.peers.push(self_info);
+                }
+                self.collab.error = None;
+            }
+            CollabEvent::Rejected { reason } => {
+                self.collab.reset();
+                self.collab.error = Some(reason);
+            }
+            CollabEvent::PeerJoined(info) => {
+                if !self.collab.peers.iter().any(|p| p.id == info.id) {
+                    self.collab.peers.push(info);
+                }
+            }
+            CollabEvent::PeerLeft(id) => {
+                self.collab.peers.retain(|p| p.id != id);
+                self.collab.presence.remove(&id);
+            }
+            CollabEvent::Presence { peer, presence } => {
+                self.collab.presence.insert(peer, presence);
+            }
+            CollabEvent::Message(_) => {
+                // Replicated ops and snapshots are applied in a later phase.
+            }
+            CollabEvent::Error(msg) => self.collab.error = Some(msg),
+            CollabEvent::Stopped => self.collab.reset(),
+        }
     }
 
     /// Is the command currently runnable? (drives menu enablement)
