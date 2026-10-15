@@ -620,6 +620,8 @@ pub struct PhotocraftApp {
     /// Cooperative-working events from the `netcode` transport thread (see `netcode` in the
     /// desktop app). `None` in tests, the web build and headless sessions.
     collab_rx: Option<Receiver<photocraft_engine::collab::CollabEvent>>,
+    /// The last presence this peer sent and the frame it was sent, to throttle updates.
+    pub(crate) collab_presence: Option<(photocraft_engine::collab::Presence, u64)>,
     pending_screenshots: Vec<(u64, Option<String>, Sender<ControlResponse>)>,
     /// Screenshots not yet requested from the viewport: (token, earliest time in ms, frames seen).
     queued_screenshots: Vec<(u64, f64, u32)>,
@@ -854,6 +856,7 @@ impl PhotocraftApp {
             opacity_keys: None,
             control_rx: None,
             collab_rx: None,
+            collab_presence: None,
             pending_screenshots: Vec::new(),
             queued_screenshots: Vec::new(),
             input_waiters: Vec::new(),

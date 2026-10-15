@@ -5,6 +5,8 @@
 //! The selection itself lives in [`DocState::selected_layers`] (UI state, like the active layer):
 //! changing it never adds a history step. Every structural change below is one history step.
 
+use std::sync::Arc;
+
 use photocraft_color::PixelFormat;
 use photocraft_doc::{Document, Layer, LayerContent, LayerId};
 use photocraft_geom::Rect;
@@ -742,6 +744,46 @@ pub fn same_pixels(a: &Document, b: &Document) -> bool {
             })
     }
     doc_pixels_equal(a, b) && walk(&a.layers, &b.layers, 0)
+}
+
+/// Reduce an after-layer to what a cooperative-working patch must carry: its metadata plus only
+/// the pixel tiles (and mask tiles) that differ from `before`. A tile present before and gone now
+/// is replaced by a default tile, so the receiver clears it (a missing tile reads as the default
+/// pixel). The surface defaults are kept by cloning, not rebuilding. `None` when a tile could not
+/// be allocated, in which case the caller sends a full snapshot instead.
+pub(crate) fn prune_changed_layer(before: &Layer, after: &Layer) -> Option<Layer> {
+    let mut out = after.clone();
+    if let (Some(b), Some(o)) = (before.surface(), out.surface_mut()) {
+        prune_surface(b, o)?;
+    }
+    if let (Some(b), Some(o)) = (before.mask.as_ref(), out.mask.as_mut()) {
+        prune_surface(&b.surface, &mut o.surface)?;
+    }
+    Some(out)
+}
+
+/// Drop from `after` every tile that is unchanged from `before` (same `Arc` pointer) and write a
+/// default tile where a tile was removed. See [`prune_changed_layer`].
+fn prune_surface(before: &photocraft_doc::Surface, after: &mut photocraft_doc::Surface) -> Option<()> {
+    use std::collections::{HashMap, HashSet};
+    let before_ptrs: HashMap<photocraft_geom::TileCoord, usize> = before.tiles().map(|(c, t)| (*c, Arc::as_ptr(t) as usize)).collect();
+    let after_coords: HashSet<photocraft_geom::TileCoord> = after.tiles().map(|(c, _)| *c).collect();
+    let unchanged: Vec<photocraft_geom::Rect> = after
+        .tiles()
+        .filter_map(|(c, t)| {
+            let ptr = Arc::as_ptr(t) as usize;
+            (before_ptrs.get(c) == Some(&ptr)).then(|| c.rect())
+        })
+        .collect();
+    for r in unchanged {
+        after.take_tiles(r);
+    }
+    let removed: Vec<photocraft_geom::TileCoord> = before.tiles().map(|(c, _)| *c).filter(|c| !after_coords.contains(c)).collect();
+    if !removed.is_empty() {
+        let def = Arc::new(after.try_default_tile().ok()?);
+        after.put_tiles(removed.into_iter().map(|c| (c, def.clone())));
+    }
+    Some(())
 }
 
 /// The layers whose rendered pixels changed between `a` and `b`, for cooperative-working's

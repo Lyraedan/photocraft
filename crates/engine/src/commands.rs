@@ -104,10 +104,10 @@ pub(crate) fn is_mask_target(p: &Value) -> bool {
 }
 
 fn can_undo(s: &Session) -> std::result::Result<(), String> {
-    s.active().filter(|d| d.history.can_undo()).map(|_| ()).ok_or_else(|| "nothing to undo".into())
+    if s.can_undo() { Ok(()) } else { Err("nothing to undo".into()) }
 }
 fn can_redo(s: &Session) -> std::result::Result<(), String> {
-    s.active().filter(|d| d.history.can_redo()).map(|_| ()).ok_or_else(|| "nothing to redo".into())
+    if s.can_redo() { Ok(()) } else { Err("nothing to redo".into()) }
 }
 fn has_selection(s: &Session) -> std::result::Result<(), String> {
     s.active().filter(|d| d.doc.selection.is_some()).map(|_| ()).ok_or_else(|| "no selection".into())

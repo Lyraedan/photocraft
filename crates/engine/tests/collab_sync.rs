@@ -176,6 +176,133 @@ fn a_layer_lock_refuses_another_artist() {
     assert_eq!(before, after, "the refused edit did not change the host");
 }
 
+/// Undo in a session reverts only this peer's own edit; another artist's change to the same
+/// document survives, and redo replays it.
+#[test]
+fn undo_is_per_artist() {
+    let (mut host, mut guest, hlog, glog) = shared_pair();
+    let red = |s: &mut Session| s.execute("document.pixel", json!({"x": 4, "y": 4})).unwrap();
+    let green = |s: &mut Session| s.execute("document.pixel", json!({"x": 20, "y": 20})).unwrap();
+    let chan = |px: &serde_json::Value, i: usize| px.as_array().and_then(|a| a.get(i)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    // Red needs a high red and a low green; green the reverse. White (all high) is neither.
+    let is_red = |px: &serde_json::Value| chan(px, 0) > 0.5 && chan(px, 1) < 0.5;
+    let is_green = |px: &serde_json::Value| chan(px, 1) > 0.5 && chan(px, 0) < 0.5;
+
+    // A remote edit is not undoable by this peer.
+    assert!(!guest.can_undo(), "nothing of the guest's own to undo yet");
+
+    // The host paints red at (4,4); the guest applies it.
+    host.execute("paint.stroke", json!({"points": [[4.0, 4.0, 1.0]], "size": 6, "color": "#ff0000"})).unwrap();
+    let (hdoc, _r, hb) = take_patch(&hlog).unwrap();
+    guest.collab_receive(CollabEvent::Patch { author: 0, doc: hdoc, rev: 0, bytes: hb });
+    assert!(!guest.can_undo(), "an applied remote patch is not in the guest's own undo stack");
+    assert!(is_red(&red(&mut guest)), "the guest sees the host's red");
+
+    // The guest paints green at (20,20); the host applies it.
+    guest.execute("paint.stroke", json!({"points": [[20.0, 20.0, 1.0]], "size": 6, "color": "#00ff00"})).unwrap();
+    let (gdoc, grev, gb) = take_patch(&glog).unwrap();
+    host.collab_receive(CollabEvent::Patch { author: 1, doc: gdoc, rev: grev, bytes: gb });
+    assert!(guest.can_undo() && host.can_undo(), "each peer can undo its own edit");
+
+    // The guest undoes: its green goes, the host's red stays, on both peers.
+    assert!(guest.undo());
+    let (udoc, _r, ub) = take_patch(&glog).unwrap();
+    host.collab_receive(CollabEvent::Patch { author: 1, doc: udoc, rev: 0, bytes: ub });
+    assert!(!is_green(&green(&mut guest)), "the guest's dab is undone");
+    assert!(is_red(&red(&mut guest)), "the host's red survives the guest's undo");
+    assert!(is_red(&red(&mut host)) && !is_green(&green(&mut host)), "the host agrees after the undo");
+
+    // Redo brings the guest's dab back, without touching the host's red.
+    assert!(guest.redo());
+    let (rdoc, _r, rb) = take_patch(&glog).unwrap();
+    host.collab_receive(CollabEvent::Patch { author: 1, doc: rdoc, rev: 0, bytes: rb });
+    assert!(is_green(&green(&mut guest)) && is_red(&red(&mut guest)), "redo replays the guest's dab");
+    assert!(is_red(&red(&mut host)) && is_green(&green(&mut host)), "the host agrees after the redo");
+}
+
+#[test]
+fn a_late_guest_gets_the_current_document() {
+    let mut host = host_session();
+    let doc = host.active().unwrap().doc.id;
+    let (link, _log) = recorder();
+    host.collab_install_link(link);
+    host.collab.role = CollabRole::Host { addr: "x".into() };
+    host.collab.shared = Some(doc);
+    // The host edits before anyone has joined.
+    host.execute("paint.stroke", json!({"points": [[7.0, 7.0, 1.0]], "size": 6, "color": "#0000ff"})).unwrap();
+    let edited = host.execute("document.pixel", json!({"x": 7, "y": 7})).unwrap();
+
+    // A guest joins late: the snapshot already carries the edit.
+    let snapshot = photocraft_format::save_to_bytes(&host.active().unwrap().doc, &photocraft_format::SaveOptions::default()).unwrap();
+    let mut guest = Session::new();
+    let (glink, _glog) = recorder();
+    guest.collab_install_link(glink);
+    guest.collab.role = CollabRole::Guest { addr: "x".into() };
+    guest.collab_receive(CollabEvent::Snapshot { author: 0, doc: doc.0, bytes: snapshot });
+    assert_eq!(guest.execute("document.pixel", json!({"x": 7, "y": 7})).unwrap(), edited, "the late guest sees the current document");
+}
+
+#[test]
+fn closing_the_shared_document_ends_the_session() {
+    let (mut host, _guest, _hlog, _glog) = shared_pair();
+    assert!(host.collab.role.is_host());
+    let index = host.active_index().unwrap();
+    host.close(index);
+    assert!(host.collab.role.is_off() && host.collab.shared.is_none(), "closing the shared document leaves the session");
+}
+
+#[test]
+fn coalesced_edits_fold_into_one_undo_step() {
+    let (mut host, _guest, _hlog, _glog) = shared_pair();
+    host.execute("paint.stroke", json!({"points": [[2.0, 2.0, 1.0]], "size": 4, "coalesce": "drag"})).unwrap();
+    host.execute("paint.stroke", json!({"points": [[3.0, 3.0, 1.0]], "size": 4, "coalesce": "drag"})).unwrap();
+    assert_eq!(host.collab.local_undo.len(), 1, "one slider drag is one undo step");
+    // A different key starts a new step.
+    host.execute("paint.stroke", json!({"points": [[5.0, 5.0, 1.0]], "size": 4, "coalesce": "other"})).unwrap();
+    assert_eq!(host.collab.local_undo.len(), 2);
+}
+
+#[test]
+fn a_patch_carries_only_changed_tiles() {
+    let mut host = Session::new();
+    host.execute("file.new", json!({"width": 1024, "height": 1024, "mode": "rgb", "depth": 8, "background": "white"})).unwrap();
+    let doc = host.active().unwrap().doc.id;
+    let (link, log) = recorder();
+    host.collab_install_link(link);
+    host.collab.role = CollabRole::Host { addr: "x".into() };
+    host.collab.shared = Some(doc);
+    host.collab.peers = vec![PeerInfo { id: 0, name: "H".into(), color: 0 }, PeerInfo { id: 1, name: "G".into(), color: 1 }];
+
+    // A wide stroke makes the layer hold many tiles; its patch is large.
+    host.execute("paint.stroke", json!({"points": [[10.0, 10.0, 1.0], [1000.0, 10.0, 1.0]], "size": 40, "color": "#808080"})).unwrap();
+    let broad = take_patch(&log).unwrap().2.len();
+    let snapshot = photocraft_format::save_to_bytes(&host.active().unwrap().doc, &photocraft_format::SaveOptions::default()).unwrap();
+
+    // A tiny dab after that: its patch carries only the touched tile(s), not the whole layer.
+    log.lock().unwrap().clear();
+    host.execute("paint.stroke", json!({"points": [[500.0, 500.0, 1.0]], "size": 4, "color": "#ff0000"})).unwrap();
+    let (pdoc, rev, bytes) = take_patch(&log).unwrap();
+    let patch_len = bytes.len();
+    assert!(patch_len * 4 < broad, "a small dab's patch ({patch_len}) is far smaller than the broad stroke's ({broad})");
+
+    // The guest loads the snapshot then the patch and matches the host everywhere.
+    let mut guest = Session::new();
+    let (glink, _glog) = recorder();
+    guest.collab_install_link(glink);
+    guest.collab.role = CollabRole::Guest { addr: "x".into() };
+    guest.collab_receive(CollabEvent::Snapshot { author: 0, doc: doc.0, bytes: snapshot });
+    guest.collab_receive(CollabEvent::Patch { author: 0, doc: pdoc, rev, bytes });
+    for (x, y) in [(500, 500), (10, 10), (900, 10), (500, 300)] {
+        assert_eq!(
+            guest.execute("document.pixel", json!({"x": x, "y": y})).unwrap(),
+            host.execute("document.pixel", json!({"x": x, "y": y})).unwrap(),
+            "pixel ({x},{y})"
+        );
+    }
+    // The pruned patch is small in absolute terms (a handful of tiles).
+    assert!(patch_len < 60_000, "pruned patch is {patch_len} bytes");
+}
+
 #[test]
 fn without_a_session_edits_do_not_journal_any_collab_request() {
     // Off-session: the edit hook must be a no-op and must not panic.

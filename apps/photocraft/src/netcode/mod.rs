@@ -50,18 +50,23 @@ impl CollabLink for Manager {
     }
 }
 
-/// An outbound frame: a control [`Wire`], or a binary document payload.
+/// An outbound frame: a control [`Wire`], or a binary document payload. The payload is an `Arc` so
+/// a broadcast to several guests shares one copy of the bytes.
 #[derive(Clone)]
 pub(crate) enum Out {
     Wire(Wire),
-    Snapshot { doc: u64, bytes: Vec<u8> },
-    Patch { doc: u64, rev: u64, bytes: Vec<u8> },
+    Snapshot { doc: u64, bytes: Arc<Vec<u8>> },
+    Patch { doc: u64, rev: u64, bytes: Arc<Vec<u8>> },
 }
+
+/// How many outbound frames may be queued for one connection before it is dropped as too slow to
+/// keep up (it reconnects and gets a fresh snapshot).
+pub(crate) const OUT_CAPACITY: usize = 256;
 
 /// A connected guest, as the host sees it: its identity and the channel to its writer thread.
 pub(crate) struct Guest {
     pub info: PeerInfo,
-    pub tx: Sender<Out>,
+    pub tx: std::sync::mpsc::SyncSender<Out>,
 }
 
 /// Shared state between the manager thread and every connection thread.
@@ -74,7 +79,7 @@ pub(crate) struct Hub {
     /// Host side: connected guests.
     guests: Mutex<Vec<Guest>>,
     /// Guest side: the link to the host's writer thread.
-    host_link: Mutex<Option<Sender<Out>>>,
+    host_link: Mutex<Option<std::sync::mpsc::SyncSender<Out>>>,
     next_id: AtomicU64,
     pub shutdown: AtomicBool,
 }
@@ -119,11 +124,11 @@ impl Hub {
     pub fn set_session(&self, session: String) {
         *lock(&self.session) = session;
     }
-    pub fn set_host_link(&self, tx: Sender<Out>) {
+    pub fn set_host_link(&self, tx: std::sync::mpsc::SyncSender<Out>) {
         *lock(&self.host_link) = Some(tx);
     }
 
-    pub fn register_guest(&self, info: PeerInfo, tx: Sender<Out>) {
+    pub fn register_guest(&self, info: PeerInfo, tx: std::sync::mpsc::SyncSender<Out>) {
         lock(&self.guests).push(Guest { info, tx });
     }
     pub fn remove_guest(&self, id: u64) {
@@ -145,15 +150,16 @@ impl Hub {
         self.broadcast_except(u64::MAX, out);
     }
 
-    /// Send to every guest except `except` (host side). Dead links are dropped.
+    /// Send to every guest except `except` (host side). A guest whose queue is full (too slow to
+    /// keep up) or whose link is gone is dropped; it reconnects and gets a fresh snapshot.
     pub fn broadcast_except(&self, except: u64, out: &Out) {
-        lock(&self.guests).retain(|g| g.info.id == except || g.tx.send(out.clone()).is_ok());
+        lock(&self.guests).retain(|g| g.info.id == except || g.tx.try_send(out.clone()).is_ok());
     }
 
-    /// Send to one guest (host side).
+    /// Send to one guest (host side). A full queue is ignored (the frame is dropped).
     pub fn send_to_peer(&self, peer: u64, out: &Out) {
         if let Some(g) = lock(&self.guests).iter().find(|g| g.info.id == peer) {
-            let _ = g.tx.send(out.clone());
+            let _ = g.tx.try_send(out.clone());
         }
     }
 
@@ -162,7 +168,7 @@ impl Hub {
         if self.is_host() {
             self.broadcast(&Out::Wire(wire));
         } else if let Some(tx) = lock(&self.host_link).as_ref() {
-            let _ = tx.send(Out::Wire(wire));
+            let _ = tx.try_send(Out::Wire(wire));
         }
     }
 
@@ -189,7 +195,7 @@ impl Hub {
         let bye = Out::Wire(Wire::Bye { reason: "session ended".into() });
         self.broadcast(&bye);
         if let Some(tx) = lock(&self.host_link).take() {
-            let _ = tx.send(bye);
+            let _ = tx.try_send(bye);
         }
         lock(&self.guests).clear();
         *lock(&self.self_info) = None;
@@ -245,11 +251,11 @@ pub(crate) fn write_out(writer: &mut impl std::io::Write, out: &Out) -> io::Resu
         Out::Wire(w) => framing::write_json(writer, w),
         Out::Snapshot { doc, bytes } => {
             let header = serde_json::json!({ "kind": "snapshot", "doc": doc }).to_string();
-            framing::write_blob(writer, header.as_bytes(), bytes)
+            framing::write_blob(writer, header.as_bytes(), bytes.as_slice())
         }
         Out::Patch { doc, rev, bytes } => {
             let header = serde_json::json!({ "kind": "patch", "doc": doc, "rev": rev }).to_string();
-            framing::write_blob(writer, header.as_bytes(), bytes)
+            framing::write_blob(writer, header.as_bytes(), bytes.as_slice())
         }
     }
 }
@@ -279,17 +285,17 @@ fn manager(rx: Receiver<CollabRequest>, hub: Arc<Hub>) {
             CollabRequest::Send(wire) => hub.send_out(wire),
             CollabRequest::SendSnapshot { peer, doc, bytes } => {
                 if hub.is_host() {
-                    hub.send_to_peer(peer, &Out::Snapshot { doc, bytes });
+                    hub.send_to_peer(peer, &Out::Snapshot { doc, bytes: Arc::new(bytes) });
                 } else if let Some(tx) = lock(&hub.host_link).as_ref() {
                     // A guest sends its whole document to the host after a structural change.
-                    let _ = tx.send(Out::Snapshot { doc, bytes });
+                    let _ = tx.try_send(Out::Snapshot { doc, bytes: Arc::new(bytes) });
                 }
             }
             CollabRequest::SendPatch { doc, rev, bytes } => {
                 if hub.is_host() {
-                    hub.broadcast(&Out::Patch { doc, rev, bytes });
+                    hub.broadcast(&Out::Patch { doc, rev, bytes: Arc::new(bytes) });
                 } else if let Some(tx) = lock(&hub.host_link).as_ref() {
-                    let _ = tx.send(Out::Patch { doc, rev, bytes });
+                    let _ = tx.try_send(Out::Patch { doc, rev, bytes: Arc::new(bytes) });
                 }
             }
             CollabRequest::SendTo { peer, wire } => {
@@ -310,7 +316,8 @@ mod tests {
 
     /// Receive until `f` yields a value or the deadline passes.
     fn wait_for<T>(rx: &Receiver<CollabEvent>, f: impl Fn(&CollabEvent) -> Option<T>) -> Option<T> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Generous: a failed connect retries with backoff before reporting.
+        let deadline = Instant::now() + Duration::from_secs(25);
         while Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(ev) => {
@@ -412,6 +419,20 @@ mod tests {
         assert_eq!(got, Some((7, 3, b"tiles".to_vec())));
 
         host.request(CollabRequest::Leave);
+        drop(guest);
+    }
+
+    #[test]
+    fn a_guest_is_told_when_the_host_leaves() {
+        let (host, host_rx) = start();
+        host.request(CollabRequest::Host { listen: "127.0.0.1:0".into(), passphrase: "pw".into(), name: "Host".into() });
+        let addr = hosting_addr(&host_rx);
+        let (guest, guest_rx, _id) = join(addr, "pw");
+        assert!(wait_for(&host_rx, |e| matches!(e, CollabEvent::PeerJoined(_)).then_some(())).is_some());
+
+        host.request(CollabRequest::Leave);
+        let ended = wait_for(&guest_rx, |e| matches!(e, CollabEvent::Disconnected { .. } | CollabEvent::Error(_)).then_some(()));
+        assert!(ended.is_some(), "the guest learns the host ended the session");
         drop(guest);
     }
 

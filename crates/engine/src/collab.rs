@@ -13,8 +13,9 @@
 //! [`Session::collab_receive`](crate::Session::collab_receive) applies.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use photocraft_doc::DocId;
+use photocraft_doc::{DocId, Document, Layer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -184,7 +185,11 @@ pub enum CollabEvent {
     Message(Box<Wire>),
     /// A transport-level problem (bind/connect/handshake/read failure).
     Error(String),
-    /// The session stopped.
+    /// The connection to the other peer(s) was lost (the host left, the network dropped). The
+    /// session is reset; `reason` is kept for the status bar. Unlike [`Self::Error`], this also
+    /// ends the session so the document is no longer treated as shared.
+    Disconnected { reason: String },
+    /// The session stopped (the user left, or hosting ended).
     Stopped,
 }
 
@@ -195,6 +200,18 @@ pub trait CollabLink: Send {
     /// Hand a request to the transport thread. Fire-and-forget: failures surface as
     /// [`CollabEvent::Error`].
     fn request(&self, req: CollabRequest);
+}
+
+/// One local edit, kept so a peer can undo only its *own* work. A content edit (paint, an
+/// adjustment, a property change) is stored per layer so undo touches just those layers and leaves
+/// another artist's layers alone; a structural edit (add/remove/group) can't be scoped that way,
+/// so it stores the whole documents and is last-writer-wins on undo.
+#[derive(Clone, Debug)]
+pub enum CollabStep {
+    /// `(layer id, content before, content after)` for every layer the edit changed.
+    Layers(Vec<(u64, Layer, Layer)>),
+    /// The document before and after a structural edit.
+    Document(Arc<Document>, Arc<Document>),
 }
 
 /// The collaboration state a [`Session`](crate::Session) carries.
@@ -220,6 +237,13 @@ pub struct CollabState {
     pub next_seq: u64,
     /// Layer ownership: layer id → the peer editing it (host-side authority, mirrored on guests).
     pub locks: BTreeMap<u64, u64>,
+    /// This peer's own recent edits, newest last, for per-artist undo (see [`CollabStep`]).
+    pub local_undo: Vec<CollabStep>,
+    /// Undone steps, newest last, for redo.
+    pub local_redo: Vec<CollabStep>,
+    /// The coalescing key of the latest recorded step, so a slider drag folds into one undo step
+    /// (matching the one history step the document gets).
+    pub local_coalesce: Option<String>,
 }
 
 impl CollabState {

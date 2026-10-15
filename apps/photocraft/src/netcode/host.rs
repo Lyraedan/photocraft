@@ -5,7 +5,7 @@ use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 
 use photocraft_engine::collab::{CollabEvent, PeerInfo, PROTOCOL, Wire, auth_proof, peer_color, proof_matches};
@@ -92,17 +92,17 @@ fn accept_conn(hub: Arc<Hub>, stream: TcpStream) {
     let id = hub.next_peer_id();
     let info = PeerInfo { id, name, color: peer_color(id) };
     let peers = hub.peers_snapshot();
-    let (wtx, wrx) = channel::<Out>();
+    let (wtx, wrx) = sync_channel::<Out>(super::OUT_CAPACITY);
     conn::spawn_writer(writer, wrx);
     hub.register_guest(info.clone(), wtx.clone());
-    let _ = wtx.send(Out::Wire(Wire::Welcome { peer: info.clone(), peers, session }));
+    let _ = wtx.try_send(Out::Wire(Wire::Welcome { peer: info.clone(), peers, session }));
     hub.event(CollabEvent::PeerJoined(info.clone()));
     hub.broadcast_except(info.id, &Out::Wire(Wire::PeerJoined { peer: info.clone() }));
 
     loop {
         match read_in(&mut reader, &hub.shutdown) {
             Ok(Some(Incoming::Wire(Wire::Ping))) => {
-                let _ = wtx.send(Out::Wire(Wire::Pong));
+                let _ = wtx.try_send(Out::Wire(Wire::Pong));
             }
             Ok(Some(Incoming::Wire(Wire::Pong))) => {}
             Ok(Some(Incoming::Wire(Wire::Bye { .. }))) => break,

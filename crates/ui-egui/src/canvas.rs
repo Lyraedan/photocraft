@@ -3781,6 +3781,8 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         draw_transform_controls(app, &painter, &xf);
         crate::move_hover::draw(app, &painter, &xf, idx, response.hover_pos());
         crate::object_finder::draw(app, &painter, &xf, idx, response.hover_pos());
+        // Cooperative working: tell the other artists where this one's cursor is.
+        crate::collab_ui::publish(app, response.hover_pos().map(|p| xf.to_doc(p)));
         crate::layer_pick_ui::show(app, &ctx);
         let shown = app.ui.views.get(idx).cloned();
         crate::canvas_tool_menu::show(app, &ctx);
@@ -3812,6 +3814,8 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         crate::slice_ui::draw_overlay(app, &painter, &xf);
         crate::frame_tool::draw_overlay(app, &painter, &xf);
         crate::artboard_tool::draw_overlay(app, &painter, &xf);
+        // Cooperative working: the other artists' cursors and name tags.
+        crate::collab_ui::draw_cursors(app, &painter, &xf);
         // Tool cursors (Photoshop-style).
         let guide_hover = response.hover_pos().and_then(|p| {
             let d = xf.to_doc(p);

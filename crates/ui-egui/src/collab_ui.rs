@@ -8,11 +8,92 @@
 //! failure (a bad address, a busy port, …) is shown inside the dialog so it can be tried again.
 //! The last name/IP/port/address are remembered ([`CollabInputs`]).
 
+use photocraft_engine::collab::{CollabRequest, Presence, Wire};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::PhotocraftApp;
 use crate::i18n;
+
+/// Publish this peer's presence (cursor, active layer) while in a session, throttled to a few
+/// updates a second. Called from the canvas each frame with the cursor in document coordinates.
+pub fn publish(app: &mut PhotocraftApp, cursor: Option<[f64; 2]>) {
+    if app.session.collab.role.is_off() {
+        return;
+    }
+    let layer = app.session.active().and_then(|st| st.active_layer).map(|l| l.0);
+    let presence = Presence { cursor, layer, tool: None };
+    // Throttle: send when it changed, and at most every few frames while it keeps changing.
+    let now = app.frame;
+    if let Some((last, at)) = &app.collab_presence
+        && (last == &presence || now.saturating_sub(*at) < 6)
+    {
+        return;
+    }
+    let peer = app.session.collab.self_id;
+    let _ = app.session.collab_request(CollabRequest::Send(Wire::Presence { peer, presence: presence.clone() }));
+    app.collab_presence = Some((presence, now));
+}
+
+/// Draw every other artist's cursor, with their name, on the canvas.
+pub fn draw_cursors(app: &PhotocraftApp, painter: &egui::Painter, xf: &crate::canvas::ViewXform) {
+    if app.session.collab.role.is_off() {
+        return;
+    }
+    let self_id = app.session.collab.self_id;
+    for peer in &app.session.collab.peers {
+        if peer.id == self_id {
+            continue;
+        }
+        let Some(c) = app.session.collab.presence.get(&peer.id).and_then(|p| p.cursor) else { continue };
+        let pos = xf.to_screen(c[0] as f32, c[1] as f32);
+        if !painter.clip_rect().contains(pos) {
+            continue;
+        }
+        draw_peer_cursor(painter, pos, &peer.name, peer_color(peer.color));
+    }
+}
+
+/// Mark a Layers-panel row in a session: a coloured strip when another artist owns (is editing)
+/// the layer, and a dot when it is their selected layer.
+pub fn draw_layer_badge(app: &PhotocraftApp, painter: &egui::Painter, rect: egui::Rect, layer: u64) {
+    if app.session.collab.role.is_off() {
+        return;
+    }
+    let self_id = app.session.collab.self_id;
+    if let Some(&owner) = app.session.collab.locks.get(&layer)
+        && owner != self_id
+        && let Some(peer) = app.session.collab.peer(owner)
+    {
+        let bar = egui::Rect::from_min_max(egui::pos2(rect.right() - 3.0, rect.top() + 2.0), egui::pos2(rect.right(), rect.bottom() - 2.0));
+        painter.rect_filled(bar, 1.0, peer_color(peer.color));
+    }
+    for peer in &app.session.collab.peers {
+        if peer.id == self_id {
+            continue;
+        }
+        if app.session.collab.presence.get(&peer.id).and_then(|p| p.layer) == Some(layer) {
+            painter.circle_filled(egui::pos2(rect.right() - 9.0, rect.center().y), 3.5, peer_color(peer.color));
+            break;
+        }
+    }
+}
+
+fn peer_color(packed: u32) -> egui::Color32 {
+    egui::Color32::from_rgb(((packed >> 16) & 0xff) as u8, ((packed >> 8) & 0xff) as u8, (packed & 0xff) as u8)
+}
+
+fn draw_peer_cursor(painter: &egui::Painter, pos: egui::Pos2, name: &str, color: egui::Color32) {
+    // A small arrow at the cursor.
+    let arrow = vec![pos, pos + egui::vec2(0.0, 16.0), pos + egui::vec2(11.0, 11.0)];
+    painter.add(egui::Shape::convex_polygon(arrow, color, egui::Stroke::new(1.0, egui::Color32::WHITE)));
+    // A name tag below it.
+    let galley = painter.layout_no_wrap(name.to_string(), egui::FontId::proportional(11.0), egui::Color32::WHITE);
+    let pad = egui::vec2(4.0, 2.0);
+    let rect = egui::Rect::from_min_size(pos + egui::vec2(12.0, 14.0), galley.size() + pad * 2.0);
+    painter.rect_filled(rect, 3.0, color);
+    painter.galley(rect.min + pad, galley, egui::Color32::WHITE);
+}
 
 /// The open Collaborate dialog (stored in [`crate::state::UiState::collab_dialog`]).
 #[derive(Clone, Debug, PartialEq)]

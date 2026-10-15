@@ -594,11 +594,17 @@ impl Session {
         if index >= self.docs.len() {
             return None;
         }
+        let closing = self.docs.get(index).map(|d| d.doc.id);
         smart_cmds::on_close(self, index);
         if let Some(id) = self.docs.get(index).map(|d| d.doc.id) {
             self.cancel_jobs_on(id);
             self.subject_cache.forget_doc(id);
             self.object_finder.forget_doc(id);
+        }
+        // Closing the shared document ends the session for everyone.
+        if self.collab.shared.is_some() && self.collab.shared == closing && !self.collab.role.is_off() {
+            let _ = self.collab_request(collab::CollabRequest::Leave);
+            self.collab.reset();
         }
         let d = self.docs.remove(index);
         self.active = if self.docs.is_empty() {
@@ -706,6 +712,10 @@ impl Session {
             CollabEvent::Patch { author, doc, rev, bytes } => self.collab_on_patch(author, doc, rev, &bytes),
             CollabEvent::Message(wire) => self.collab_on_wire(&wire),
             CollabEvent::Error(msg) => self.collab.error = Some(msg),
+            CollabEvent::Disconnected { reason } => {
+                self.collab.reset();
+                self.collab.error = Some(reason);
+            }
             CollabEvent::Stopped => self.collab.reset(),
         }
     }
@@ -788,21 +798,32 @@ impl Session {
     fn collab_host_broadcast(&mut self, shared: photocraft_doc::DocId, before: &Document, after: &Document) {
         match crate::layer_multi_cmds::changed_layers(before, after) {
             Some(layers) if layers.is_empty() => {}
-            Some(layers) => {
-                if let Some(bytes) = serialize_layer_patch(after, layers) {
+            Some(layers) => match patch_bytes(before, after, layers) {
+                Some(bytes) => {
                     self.collab.next_seq = self.collab.next_seq.wrapping_add(1);
                     let rev = self.collab.next_seq;
                     let _ = self.collab_request(collab::CollabRequest::SendPatch { doc: shared.0, rev, bytes });
                 }
-            }
-            None => {
-                let Some((doc, bytes)) = self.collab_snapshot_for_shared() else { return };
-                let peers: Vec<u64> = self.collab.peers.iter().map(|p| p.id).filter(|id| *id != self.collab.self_id).collect();
-                for peer in peers {
-                    let _ = self.collab_request(collab::CollabRequest::SendSnapshot { peer, doc, bytes: bytes.clone() });
-                }
-            }
+                None => self.collab_send_snapshot_to_peers(),
+            },
+            None => self.collab_send_snapshot_to_peers(),
         }
+    }
+
+    /// Send the whole shared document to every other peer (a structural change, or one the tile
+    /// patch could not express).
+    fn collab_send_snapshot_to_peers(&mut self) {
+        let Some((doc, bytes)) = self.collab_snapshot_for_shared() else { return };
+        let peers: Vec<u64> = self.collab.peers.iter().map(|p| p.id).filter(|id| *id != self.collab.self_id).collect();
+        for peer in peers {
+            let _ = self.collab_request(collab::CollabRequest::SendSnapshot { peer, doc, bytes: bytes.clone() });
+        }
+    }
+
+    /// Send the whole shared document to the host (a guest's structural change it must adopt).
+    fn collab_send_snapshot_to_host(&mut self) {
+        let Some((doc, bytes)) = self.collab_snapshot_for_shared() else { return };
+        let _ = self.collab_request(collab::CollabRequest::SendSnapshot { peer: 0, doc, bytes });
     }
 
     /// Guest: send a local edit to the host — a patch for existing layers, or the whole document
@@ -810,15 +831,13 @@ impl Session {
     fn collab_guest_send(&mut self, shared: photocraft_doc::DocId, before: &Document, after: &Document) {
         match crate::layer_multi_cmds::changed_layers(before, after) {
             Some(layers) if layers.is_empty() => {}
-            Some(layers) => {
-                if let Some(bytes) = serialize_layer_patch(after, layers) {
+            Some(layers) => match patch_bytes(before, after, layers) {
+                Some(bytes) => {
                     let _ = self.collab_request(collab::CollabRequest::SendPatch { doc: shared.0, rev: 0, bytes });
                 }
-            }
-            None => {
-                let Some((doc, bytes)) = self.collab_snapshot_for_shared() else { return };
-                let _ = self.collab_request(collab::CollabRequest::SendSnapshot { peer: 0, doc, bytes });
-            }
+                None => self.collab_send_snapshot_to_host(),
+            },
+            None => self.collab_send_snapshot_to_host(),
         }
     }
 
@@ -925,7 +944,7 @@ impl Session {
         let mut applied = false;
         for layer in patch.layers {
             if let Some(slot) = doc.layer_mut(layer.id) {
-                *slot = layer;
+                merge_layer(slot, layer);
                 applied = true;
             }
         }
@@ -1067,6 +1086,8 @@ impl Session {
         if let (true, Some(before)) = (collab_active, collab_before) {
             let after = self.active().map(|st| st.doc.clone());
             if let Some(after) = after {
+                // Record the step for per-artist undo, then ship it to the other peers.
+                self.collab_record_step(&before, &after);
                 self.collab_broadcast_docs(&before, &after);
             }
         }
@@ -1140,7 +1161,10 @@ impl Session {
         if self.active_job().is_some() {
             return false;
         }
-        let collab_active = !self.collab.role.is_off();
+        // In a session, undo is per-artist: it reverts this peer's own last edit only.
+        if !self.collab.role.is_off() {
+            return self.collab_undo();
+        }
         let Some(st) = self.active_mut() else { return false };
         st.coalesce = None;
         let Some((mut d, layers)) = st.history.undo(st.doc.clone()) else { return false };
@@ -1151,15 +1175,10 @@ impl Session {
         // Pixels this step can have touched, so the canvas recomposites only that
         // (it recomposited everything before).
         let damage = layer_multi_cmds::step_damage(&d, &st.doc);
-        let before = st.doc.clone();
         st.doc = d;
         restore_target(st, layers);
         st.revision += 1;
         st.last_damage = damage;
-        let after = st.doc.clone();
-        if collab_active {
-            self.collab_broadcast_docs(&before, &after);
-        }
         true
     }
 
@@ -1167,7 +1186,10 @@ impl Session {
         if self.active_job().is_some() {
             return false;
         }
-        let collab_active = !self.collab.role.is_off();
+        // In a session, redo replays this peer's own undone edit only.
+        if !self.collab.role.is_off() {
+            return self.collab_redo();
+        }
         let Some(st) = self.active_mut() else { return false };
         st.coalesce = None;
         let Some((mut d, layers)) = st.history.redo(st.doc.clone()) else { return false };
@@ -1175,15 +1197,131 @@ impl Session {
             Arc::make_mut(&mut d).name.clone_from(&st.doc.name);
         }
         let damage = layer_multi_cmds::step_damage(&st.doc, &d);
-        let before = st.doc.clone();
         st.doc = d;
         restore_target(st, layers);
         st.revision += 1;
         st.last_damage = damage;
-        let after = st.doc.clone();
-        if collab_active {
-            self.collab_broadcast_docs(&before, &after);
+        true
+    }
+
+    /// Whether `undo`/`redo` have something to do: this peer's own step while in a session, else
+    /// the document history. The Edit menu's enablement reads these.
+    pub fn can_undo(&self) -> bool {
+        if !self.collab.role.is_off() {
+            return !self.collab.local_undo.is_empty();
         }
+        self.active().is_some_and(|st| st.history.can_undo())
+    }
+
+    pub fn can_redo(&self) -> bool {
+        if !self.collab.role.is_off() {
+            return !self.collab.local_redo.is_empty();
+        }
+        self.active().is_some_and(|st| st.history.can_redo())
+    }
+
+    /// Remember a local edit for per-artist undo: a layer-scoped step for a content change, or the
+    /// whole documents for a structural one. Any new edit clears the redo stack.
+    fn collab_record_step(&mut self, before: &Document, after: &Document) {
+        if self.collab.shared != Some(after.id) {
+            return;
+        }
+        // Fold into the previous step when this edit coalesces with it (one slider drag = one undo).
+        let key = self.coalesce_request.clone();
+        if key.is_some()
+            && key == self.collab.local_coalesce
+            && let Some(collab::CollabStep::Layers(entries)) = self.collab.local_undo.last_mut()
+        {
+            if let Some(layers) = crate::layer_multi_cmds::changed_layers(before, after) {
+                let mut after_map: std::collections::HashMap<u64, photocraft_doc::Layer> = layers.into_iter().map(|l| (l.id.0, l)).collect();
+                for (id, _before, step_after) in entries.iter_mut() {
+                    if let Some(new_after) = after_map.remove(id) {
+                        *step_after = new_after;
+                    }
+                }
+                for (id, new_after) in after_map {
+                    if let Some(b) = before.layer(LayerId(id)) {
+                        entries.push((id, b.clone(), new_after));
+                    }
+                }
+            }
+            self.collab.local_redo.clear();
+            return;
+        }
+        let step = match crate::layer_multi_cmds::changed_layers(before, after) {
+            Some(layers) if layers.is_empty() => return,
+            Some(layers) => {
+                let entries: Vec<(u64, photocraft_doc::Layer, photocraft_doc::Layer)> =
+                    layers.into_iter().filter_map(|l| before.layer(l.id).map(|b| (l.id.0, b.clone(), l))).collect();
+                if entries.is_empty() {
+                    return;
+                }
+                collab::CollabStep::Layers(entries)
+            }
+            None => collab::CollabStep::Document(Arc::new(before.clone()), Arc::new(after.clone())),
+        };
+        const MAX_STEPS: usize = 100;
+        if self.collab.local_undo.len() >= MAX_STEPS {
+            self.collab.local_undo.remove(0);
+        }
+        self.collab.local_undo.push(step);
+        self.collab.local_coalesce = key;
+        self.collab.local_redo.clear();
+    }
+
+    /// Undo this peer's own last edit (session mode).
+    fn collab_undo(&mut self) -> bool {
+        let Some(step) = self.collab.local_undo.pop() else { return false };
+        if self.collab_apply_step(&step, false) {
+            self.collab.local_redo.push(step);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Redo this peer's own last undone edit (session mode).
+    fn collab_redo(&mut self) -> bool {
+        let Some(step) = self.collab.local_redo.pop() else { return false };
+        if self.collab_apply_step(&step, true) {
+            self.collab.local_undo.push(step);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply a step to the shared document (forward for redo, backward for undo) and ship the
+    /// change to the other peers. Only the step's own layers are touched, so another artist's
+    /// layers are left as they are.
+    fn collab_apply_step(&mut self, step: &collab::CollabStep, forward: bool) -> bool {
+        let Some(shared) = self.collab.shared else { return false };
+        let Some(st) = self.docs.iter_mut().find(|st| st.doc.id == shared) else { return false };
+        let before_doc = st.doc.clone();
+        match step {
+            collab::CollabStep::Layers(entries) => {
+                let mut doc = (*st.doc).clone();
+                let mut applied = false;
+                for (id, before, after) in entries {
+                    let target = if forward { after } else { before };
+                    if let Some(slot) = doc.layer_mut(LayerId(*id)) {
+                        *slot = target.clone();
+                        applied = true;
+                    }
+                }
+                if !applied {
+                    return false;
+                }
+                st.doc = Arc::new(doc);
+            }
+            collab::CollabStep::Document(before, after) => {
+                st.doc = Arc::clone(if forward { after } else { before });
+            }
+        }
+        st.revision += 1;
+        st.last_damage = None;
+        let after_doc = st.doc.clone();
+        self.collab_broadcast_docs(&before_doc, &after_doc);
         true
     }
 }
@@ -1236,6 +1374,41 @@ pub(crate) fn fix_selection(st: &mut DocState) {
 
 /// Serialize a set of changed layers as a small `.pcraft` bundle (tiles shared, so cloning the
 /// layers is cheap) for a cooperative-working patch. `None` if serialization fails.
+/// Serialize the changed layers as a tile-pruned patch: only the tiles that differ from the
+/// sender's state (plus default tiles for removed ones). `None` when a layer can't be pruned, so
+/// the caller sends a full snapshot instead.
+fn patch_bytes(before: &Document, after: &Document, layers: Vec<photocraft_doc::Layer>) -> Option<Vec<u8>> {
+    let mut pruned = Vec::with_capacity(layers.len());
+    for y in layers {
+        let x = before.layer(y.id)?;
+        pruned.push(crate::layer_multi_cmds::prune_changed_layer(x, &y)?);
+    }
+    serialize_layer_patch(after, pruned)
+}
+
+/// Apply a received (pruned) layer patch onto `dst`: take the patch's metadata and its tiles, and
+/// keep the destination's tiles that the patch did not carry.
+fn merge_layer(dst: &mut photocraft_doc::Layer, patch: photocraft_doc::Layer) {
+    let mut merged = patch;
+    if let (Some(src), Some(out)) = (dst.surface(), merged.surface_mut()) {
+        merge_tiles(src, out);
+    }
+    if let (Some(src), Some(out)) = (dst.mask.as_ref().map(|m| &m.surface), merged.mask.as_mut().map(|m| &mut m.surface)) {
+        merge_tiles(src, out);
+    }
+    *dst = merged;
+}
+
+/// Put every tile of `src` that `dst` lacks into `dst`.
+fn merge_tiles(src: &photocraft_doc::Surface, dst: &mut photocraft_doc::Surface) {
+    use std::collections::HashSet;
+    let have: HashSet<photocraft_geom::TileCoord> = dst.tiles().map(|(c, _)| *c).collect();
+    let extra: Vec<_> = src.tiles().filter(|(c, _)| !have.contains(c)).map(|(c, t)| (*c, t.clone())).collect();
+    if !extra.is_empty() {
+        dst.put_tiles(extra);
+    }
+}
+
 fn serialize_layer_patch(source: &Document, layers: Vec<photocraft_doc::Layer>) -> Option<Vec<u8>> {
     let mut patch = Document::new(source.name.clone(), source.size, source.mode, source.depth);
     patch.icc_profile = source.icc_profile.clone();
