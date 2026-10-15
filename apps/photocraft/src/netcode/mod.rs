@@ -6,9 +6,9 @@
 //! [`CollabEvent`]s the app drains each frame. It is native-only: the web build has no transport.
 //!
 //! Topology: one artist hosts and listens on `IP:port`; every other artist is a guest connected
-//! to the host. The host is the relay — a guest's presence (and later, its edits) go to the host,
-//! which forwards them to the other guests and applies them locally. This phase carries the
-//! handshake, the peer list and presence; replicated edits come next.
+//! to the host. The host is the relay and the authority: a guest's presence goes to the host,
+//! which forwards it to the other guests; the host sends the shared document to each new guest
+//! and streams edits to the others as small binary patches.
 
 mod auth;
 mod conn;
@@ -16,11 +16,13 @@ mod framing;
 mod guest;
 mod host;
 
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use photocraft_engine::collab::{CollabEvent, CollabLink, CollabRequest, PeerInfo, Wire};
+use serde_json::Value;
 
 /// Start the transport manager thread. Returns the link to install on the session (via
 /// [`Session::collab_install_link`](photocraft_engine::Session::collab_install_link)) and the
@@ -48,10 +50,18 @@ impl CollabLink for Manager {
     }
 }
 
+/// An outbound frame: a control [`Wire`], or a binary document payload.
+#[derive(Clone)]
+pub(crate) enum Out {
+    Wire(Wire),
+    Snapshot { doc: u64, bytes: Vec<u8> },
+    Patch { doc: u64, rev: u64, bytes: Vec<u8> },
+}
+
 /// A connected guest, as the host sees it: its identity and the channel to its writer thread.
 pub(crate) struct Guest {
     pub info: PeerInfo,
-    pub tx: Sender<Wire>,
+    pub tx: Sender<Out>,
 }
 
 /// Shared state between the manager thread and every connection thread.
@@ -64,7 +74,7 @@ pub(crate) struct Hub {
     /// Host side: connected guests.
     guests: Mutex<Vec<Guest>>,
     /// Guest side: the link to the host's writer thread.
-    host_link: Mutex<Option<Sender<Wire>>>,
+    host_link: Mutex<Option<Sender<Out>>>,
     next_id: AtomicU64,
     pub shutdown: AtomicBool,
 }
@@ -109,11 +119,11 @@ impl Hub {
     pub fn set_session(&self, session: String) {
         *lock(&self.session) = session;
     }
-    pub fn set_host_link(&self, tx: Sender<Wire>) {
+    pub fn set_host_link(&self, tx: Sender<Out>) {
         *lock(&self.host_link) = Some(tx);
     }
 
-    pub fn register_guest(&self, info: PeerInfo, tx: Sender<Wire>) {
+    pub fn register_guest(&self, info: PeerInfo, tx: Sender<Out>) {
         lock(&self.guests).push(Guest { info, tx });
     }
     pub fn remove_guest(&self, id: u64) {
@@ -131,21 +141,28 @@ impl Hub {
     }
 
     /// Send to every connected guest (host side). Dead links are dropped.
-    pub fn broadcast(&self, wire: &Wire) {
-        self.broadcast_except(u64::MAX, wire);
+    pub fn broadcast(&self, out: &Out) {
+        self.broadcast_except(u64::MAX, out);
     }
 
     /// Send to every guest except `except` (host side). Dead links are dropped.
-    pub fn broadcast_except(&self, except: u64, wire: &Wire) {
-        lock(&self.guests).retain(|g| g.info.id == except || g.tx.send(wire.clone()).is_ok());
+    pub fn broadcast_except(&self, except: u64, out: &Out) {
+        lock(&self.guests).retain(|g| g.info.id == except || g.tx.send(out.clone()).is_ok());
     }
 
-    /// Route an outbound message: broadcast when hosting, otherwise to the host.
+    /// Send to one guest (host side).
+    pub fn send_to_peer(&self, peer: u64, out: &Out) {
+        if let Some(g) = lock(&self.guests).iter().find(|g| g.info.id == peer) {
+            let _ = g.tx.send(out.clone());
+        }
+    }
+
+    /// Route an outbound control message: broadcast when hosting, otherwise to the host.
     pub fn send_out(&self, wire: Wire) {
         if self.is_host() {
-            self.broadcast(&wire);
+            self.broadcast(&Out::Wire(wire));
         } else if let Some(tx) = lock(&self.host_link).as_ref() {
-            let _ = tx.send(wire);
+            let _ = tx.send(Out::Wire(wire));
         }
     }
 
@@ -169,7 +186,7 @@ impl Hub {
     /// End the session: tell every peer and drop the links.
     fn stop(&self) {
         self.shutdown.store(true, Ordering::Release);
-        let bye = Wire::Bye { reason: "session ended".into() };
+        let bye = Out::Wire(Wire::Bye { reason: "session ended".into() });
         self.broadcast(&bye);
         if let Some(tx) = lock(&self.host_link).take() {
             let _ = tx.send(bye);
@@ -184,6 +201,57 @@ impl Hub {
 /// Lock a mutex, recovering from poisoning (never crash — AGENTS.md).
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A decoded inbound frame.
+pub(crate) enum Incoming {
+    Wire(Wire),
+    Snapshot { doc: u64, bytes: Vec<u8> },
+    Patch { doc: u64, rev: u64, bytes: Vec<u8> },
+}
+
+/// Read one inbound frame of either kind, decoding a binary header when present.
+pub(crate) fn read_in(reader: &mut impl Read, shutdown: &AtomicBool) -> io::Result<Option<Incoming>> {
+    let Some((kind, payload)) = framing::read_frame(reader, shutdown, framing::MAX_BLOB)? else { return Ok(None) };
+    match kind {
+        framing::KIND_JSON => serde_json::from_slice::<Wire>(&payload)
+            .map(|w| Some(Incoming::Wire(w)))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        framing::KIND_BLOB => decode_blob(&payload).map(Some),
+        other => Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected frame kind {other}"))),
+    }
+}
+
+fn decode_blob(payload: &[u8]) -> io::Result<Incoming> {
+    let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+    let header_len = payload.get(..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize).ok_or_else(|| invalid("truncated blob"))?;
+    let header = payload.get(4..4 + header_len).ok_or_else(|| invalid("truncated blob header"))?;
+    let data = payload.get(4 + header_len..).ok_or_else(|| invalid("truncated blob body"))?.to_vec();
+    let header: Value = serde_json::from_slice(header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let doc = header.get("doc").and_then(Value::as_u64).unwrap_or(0);
+    match header.get("kind").and_then(Value::as_str) {
+        Some("snapshot") => Ok(Incoming::Snapshot { doc, bytes: data }),
+        Some("patch") => {
+            let rev = header.get("rev").and_then(Value::as_u64).unwrap_or(0);
+            Ok(Incoming::Patch { doc, rev, bytes: data })
+        }
+        _ => Err(invalid("unknown blob kind")),
+    }
+}
+
+/// Write an outbound frame.
+pub(crate) fn write_out(writer: &mut impl std::io::Write, out: &Out) -> io::Result<()> {
+    match out {
+        Out::Wire(w) => framing::write_json(writer, w),
+        Out::Snapshot { doc, bytes } => {
+            let header = serde_json::json!({ "kind": "snapshot", "doc": doc }).to_string();
+            framing::write_blob(writer, header.as_bytes(), bytes)
+        }
+        Out::Patch { doc, rev, bytes } => {
+            let header = serde_json::json!({ "kind": "patch", "doc": doc, "rev": rev }).to_string();
+            framing::write_blob(writer, header.as_bytes(), bytes)
+        }
+    }
 }
 
 /// The manager loop: turn requests into listener/connector work.
@@ -209,6 +277,26 @@ fn manager(rx: Receiver<CollabRequest>, hub: Arc<Hub>) {
                 hub.event(CollabEvent::Stopped);
             }
             CollabRequest::Send(wire) => hub.send_out(wire),
+            CollabRequest::SendSnapshot { peer, doc, bytes } => {
+                if hub.is_host() {
+                    hub.send_to_peer(peer, &Out::Snapshot { doc, bytes });
+                } else if let Some(tx) = lock(&hub.host_link).as_ref() {
+                    // A guest sends its whole document to the host after a structural change.
+                    let _ = tx.send(Out::Snapshot { doc, bytes });
+                }
+            }
+            CollabRequest::SendPatch { doc, rev, bytes } => {
+                if hub.is_host() {
+                    hub.broadcast(&Out::Patch { doc, rev, bytes });
+                } else if let Some(tx) = lock(&hub.host_link).as_ref() {
+                    let _ = tx.send(Out::Patch { doc, rev, bytes });
+                }
+            }
+            CollabRequest::SendTo { peer, wire } => {
+                if hub.is_host() {
+                    hub.send_to_peer(peer, &Out::Wire(wire));
+                }
+            }
         }
     }
 }
@@ -241,6 +329,17 @@ mod tests {
         wait_for(rx, |e| if let CollabEvent::Hosting { addr } = e { Some(addr.clone()) } else { None }).expect("a Hosting event")
     }
 
+    fn join(addr: String, passphrase: &str) -> (Manager, Receiver<CollabEvent>, u64) {
+        let (guest, guest_rx) = start();
+        guest.request(CollabRequest::Join { addr, passphrase: passphrase.into(), name: "Guest".into() });
+        let id = wait_for(&guest_rx, |e| match e {
+            CollabEvent::Joined { self_info, .. } => Some(self_info.id),
+            _ => None,
+        })
+        .expect("the guest should join");
+        (guest, guest_rx, id)
+    }
+
     #[test]
     fn host_and_guest_handshake_and_relay_presence() {
         let (host, host_rx) = start();
@@ -260,7 +359,6 @@ mod tests {
         });
         assert_eq!(joined.as_deref(), Some("Guest"), "the host sees the guest join");
 
-        // The guest's presence reaches the host (relayed by the host's reader).
         guest.request(CollabRequest::Send(Wire::Presence {
             peer: self_id,
             presence: Presence { cursor: Some([3.0, 4.0]), layer: Some(9), tool: Some("brush".into()) },
@@ -272,6 +370,49 @@ mod tests {
         assert_eq!(seen, Some((self_id, Some([3.0, 4.0]))));
 
         host.request(CollabRequest::Leave);
+    }
+
+    #[test]
+    fn host_sends_a_document_snapshot_to_a_joining_guest() {
+        let (host, host_rx) = start();
+        host.request(CollabRequest::Host { listen: "127.0.0.1:0".into(), passphrase: "pw".into(), name: "Host".into() });
+        let addr = hosting_addr(&host_rx);
+        let (guest, guest_rx, _id) = join(addr, "pw");
+
+        // The host learns the peer joined and sends it a snapshot binary frame.
+        let peer_id = wait_for(&host_rx, |e| match e {
+            CollabEvent::PeerJoined(info) => Some(info.id),
+            _ => None,
+        })
+        .expect("a join");
+        host.request(CollabRequest::SendSnapshot { peer: peer_id, doc: 42, bytes: b"pcraft-bytes".to_vec() });
+        let got = wait_for(&guest_rx, |e| match e {
+            CollabEvent::Snapshot { doc, bytes, .. } => Some((*doc, bytes.clone())),
+            _ => None,
+        });
+        assert_eq!(got, Some((42, b"pcraft-bytes".to_vec())));
+
+        host.request(CollabRequest::Leave);
+        drop(guest);
+    }
+
+    #[test]
+    fn host_broadcasts_a_patch_to_guests() {
+        let (host, host_rx) = start();
+        host.request(CollabRequest::Host { listen: "127.0.0.1:0".into(), passphrase: "pw".into(), name: "Host".into() });
+        let addr = hosting_addr(&host_rx);
+        let (guest, guest_rx, _id) = join(addr, "pw");
+        assert!(wait_for(&host_rx, |e| matches!(e, CollabEvent::PeerJoined(_)).then_some(())).is_some());
+
+        host.request(CollabRequest::SendPatch { doc: 7, rev: 3, bytes: b"tiles".to_vec() });
+        let got = wait_for(&guest_rx, |e| match e {
+            CollabEvent::Patch { doc, rev, bytes, .. } => Some((*doc, *rev, bytes.clone())),
+            _ => None,
+        });
+        assert_eq!(got, Some((7, 3, b"tiles".to_vec())));
+
+        host.request(CollabRequest::Leave);
+        drop(guest);
     }
 
     #[test]

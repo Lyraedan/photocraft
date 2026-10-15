@@ -744,6 +744,52 @@ pub fn same_pixels(a: &Document, b: &Document) -> bool {
     doc_pixels_equal(a, b) && walk(&a.layers, &b.layers, 0)
 }
 
+/// The layers whose rendered pixels changed between `a` and `b`, for cooperative-working's
+/// minimal patch. Returns `Some` only when the step kept the layer tree's shape (same ids, order
+/// and nesting) and the document-level fields the compositor reads; each returned layer is
+/// cloned (tiles shared). `None` means a full snapshot is required: a structural change, a
+/// different layer kind, a group or Smart Object/Video change, or a document-level change — a
+/// partial bundle cannot carry those.
+pub(crate) fn changed_layers(a: &Document, b: &Document) -> Option<Vec<Layer>> {
+    if !doc_pixels_equal(a, b) {
+        return None;
+    }
+    fn walk(xs: &[Layer], ys: &[Layer], out: &mut Vec<Layer>, depth: usize) -> bool {
+        if depth >= 256 || xs.len() != ys.len() {
+            return false;
+        }
+        for (x, y) in xs.iter().zip(ys) {
+            if x.id != y.id || x.video.is_some() || y.video.is_some() {
+                return false;
+            }
+            if std::mem::discriminant(&x.content) != std::mem::discriminant(&y.content) {
+                return false;
+            }
+            match (x.children(), y.children()) {
+                (Some(xc), Some(yc)) => {
+                    if !walk(xc, yc, out, depth + 1) {
+                        return false;
+                    }
+                }
+                (None, None) => {}
+                _ => return false,
+            }
+            if layer_pixels_equal(x, y) {
+                continue;
+            }
+            // A Smart Object's embedded source lives in the document's global blocks, which a
+            // partial bundle would not carry; a group carries its children.
+            if matches!(y.content, LayerContent::Smart(_)) || y.children().is_some() {
+                return false;
+            }
+            out.push(y.clone());
+        }
+        true
+    }
+    let mut out = Vec::new();
+    if walk(&a.layers, &b.layers, &mut out, 0) { Some(out) } else { None }
+}
+
 /// Pixels a single history step can have changed between `a` and `b` (the documents on either
 /// side of an edit, its undo or its redo): the union of the change bounds of every layer whose
 /// pixels differ, so a local edit recomposites only that area instead of the whole canvas. A

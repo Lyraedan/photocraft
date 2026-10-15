@@ -54,6 +54,7 @@ pub mod channels_panel;
 pub mod chrome_ui;
 pub mod cjk_fonts;
 pub mod clip_line_ui;
+pub mod collab_ui;
 pub mod color_picker_ui;
 pub mod color_range_ui;
 pub mod comps_ui;
@@ -1992,6 +1993,7 @@ impl eframe::App for PhotocraftApp {
         distort_ui::show(self, &ctx);
         camera_raw_ui::show(self, &ctx);
         wide_angle_ui::show(self, &ctx);
+        collab_ui::show(self, &ctx);
         canvas::extra_windows(self, &ctx);
         notices::show(self, &ctx);
         gpu_status::show_fallback(self, &ctx);

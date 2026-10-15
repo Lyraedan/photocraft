@@ -1,4 +1,5 @@
-//! The host side: listen, authenticate guests, relay what they send, and report joins/leaves.
+//! The host side: listen, authenticate guests, relay what they send, and send the shared
+//! document to each new guest.
 
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
@@ -9,7 +10,7 @@ use std::time::Duration;
 
 use photocraft_engine::collab::{CollabEvent, PeerInfo, PROTOCOL, Wire, auth_proof, peer_color, proof_matches};
 
-use super::{Hub, conn, framing};
+use super::{Hub, Incoming, Out, conn, framing, read_in};
 
 /// Spawn the listener thread. It reports `Hosting` once bound, then accepts until shutdown.
 pub(crate) fn spawn_listener(hub: Arc<Hub>, listen: String) {
@@ -91,37 +92,41 @@ fn accept_conn(hub: Arc<Hub>, stream: TcpStream) {
     let id = hub.next_peer_id();
     let info = PeerInfo { id, name, color: peer_color(id) };
     let peers = hub.peers_snapshot();
-    let (wtx, wrx) = channel::<Wire>();
+    let (wtx, wrx) = channel::<Out>();
     conn::spawn_writer(writer, wrx);
     hub.register_guest(info.clone(), wtx.clone());
-    let _ = wtx.send(Wire::Welcome { peer: info.clone(), peers, session });
+    let _ = wtx.send(Out::Wire(Wire::Welcome { peer: info.clone(), peers, session }));
     hub.event(CollabEvent::PeerJoined(info.clone()));
-    hub.broadcast_except(info.id, &Wire::PeerJoined { peer: info.clone() });
+    hub.broadcast_except(info.id, &Out::Wire(Wire::PeerJoined { peer: info.clone() }));
 
     loop {
-        match framing::read_json(&mut reader, &hub.shutdown) {
-            Ok(Some(Wire::Ping)) => {
-                let _ = wtx.send(Wire::Pong);
+        match read_in(&mut reader, &hub.shutdown) {
+            Ok(Some(Incoming::Wire(Wire::Ping))) => {
+                let _ = wtx.send(Out::Wire(Wire::Pong));
             }
-            Ok(Some(Wire::Pong)) => {}
-            Ok(Some(Wire::Bye { .. })) => break,
-            Ok(Some(Wire::Presence { peer, presence })) => {
-                hub.broadcast_except(info.id, &Wire::Presence { peer, presence: presence.clone() });
+            Ok(Some(Incoming::Wire(Wire::Pong))) => {}
+            Ok(Some(Incoming::Wire(Wire::Bye { .. }))) => break,
+            Ok(Some(Incoming::Wire(Wire::Presence { peer, presence }))) => {
+                let out = Out::Wire(Wire::Presence { peer, presence: presence.clone() });
+                hub.broadcast_except(info.id, &out);
                 hub.event(CollabEvent::Presence { peer, presence });
             }
-            Ok(Some(wire)) => {
+            Ok(Some(Incoming::Wire(wire))) => {
                 if wire.is_relay() {
-                    hub.broadcast_except(info.id, &wire);
+                    hub.broadcast_except(info.id, &Out::Wire(wire.clone()));
                 }
                 hub.event(CollabEvent::Message(Box::new(wire)));
             }
+            // A guest's document change: the engine decides whether to adopt/apply it.
+            Ok(Some(Incoming::Snapshot { doc, bytes })) => hub.event(CollabEvent::Snapshot { author: info.id, doc, bytes }),
+            Ok(Some(Incoming::Patch { doc, rev, bytes })) => hub.event(CollabEvent::Patch { author: info.id, doc, rev, bytes }),
             Ok(None) => break,
             Err(_) => break,
         }
     }
 
     hub.remove_guest(info.id);
-    hub.broadcast_except(info.id, &Wire::PeerLeft { peer: info.id });
+    hub.broadcast_except(info.id, &Out::Wire(Wire::PeerLeft { peer: info.id }));
     hub.event(CollabEvent::PeerLeft(info.id));
 }
 

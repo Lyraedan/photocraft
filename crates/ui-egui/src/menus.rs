@@ -17,10 +17,14 @@ pub(crate) fn modal_allows(app: &PhotocraftApp, id: &str) -> bool {
 }
 
 /// Top-level menus in Photoshop order.
-pub const TOP_MENUS: [&str; 10] = ["File", "Edit", "Image", "Layer", "Type", "Select", "Filter", "View", "Window", "Help"];
+pub const TOP_MENUS: [&str; 11] = ["File", "Edit", "Image", "Layer", "Type", "Select", "Filter", "View", "Window", "Help", "Collaborate"];
 
 /// UI-level commands (handled by the shell rather than the engine): id, label, menu, shortcut.
 pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
+    // Collaborate: dialogs that gather the passphrase/address, then run the engine commands.
+    ("collab.shareDialog", "Share Document…", &["Collaborate"], None),
+    ("collab.connectDialog", "Connect to Session…", &["Collaborate"], None),
+    ("collab.sessionDialog", "Session Status…", &["Collaborate"], None),
     ("ui.symmetryTransform", "Transform Symmetry", &[], None),
     // Right-click the options bar's tool icon (#2825); `tool.resetAll` asks first.
     ("tool.reset", "Reset Tool", &[], None),
@@ -174,6 +178,11 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
     }
     if id == "ui.symmetryTransform" {
         return crate::symmetry_ui::begin(app).map(|_| Value::Null);
+    }
+    // Collaborate menu: Share… / Connect… open a small dialog, then run `collab.host` /
+    // `collab.join`.
+    if let Some(r) = crate::collab_ui::invoke(app, ctx, id, &params) {
+        return r;
     }
     if let Some(r) = crate::tool_reset::invoke(app, id, &params) {
         return r;
@@ -747,6 +756,9 @@ pub fn is_enabled(app: &PhotocraftApp, id: &str) -> bool {
     if let Some(e) = crate::workspace_ui::is_enabled(app, id) {
         return e;
     }
+    if let Some(e) = crate::collab_ui::is_enabled(app, id) {
+        return e;
+    }
     if crate::analysis_ui::handles(id) {
         return true;
     }
@@ -970,6 +982,7 @@ pub fn is_live(id: &str) -> bool {
         || crate::preset_panels::handles(id)
         || crate::type_panels_ui::handles(id)
         || crate::timeline_ui::handles(id)
+        || crate::collab_ui::handles(id)
 }
 
 /// Commands outside the catalogue that belong right after a catalogue item: `(id, after)`.

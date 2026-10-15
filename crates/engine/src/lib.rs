@@ -672,11 +672,13 @@ impl Session {
         match ev {
             CollabEvent::Hosting { addr } => {
                 self.collab.role = collab::CollabRole::Host { addr };
+                self.collab.ready = true;
                 self.collab.error = None;
             }
             CollabEvent::Joined { self_info, session } => {
                 self.collab.self_id = self_info.id;
                 self.collab.session = session;
+                self.collab.ready = true;
                 if !self.collab.peers.iter().any(|p| p.id == self_info.id) {
                     self.collab.peers.push(self_info);
                 }
@@ -688,21 +690,249 @@ impl Session {
             }
             CollabEvent::PeerJoined(info) => {
                 if !self.collab.peers.iter().any(|p| p.id == info.id) {
-                    self.collab.peers.push(info);
+                    self.collab.peers.push(info.clone());
                 }
+                self.collab_send_snapshot_to(info.id);
             }
             CollabEvent::PeerLeft(id) => {
                 self.collab.peers.retain(|p| p.id != id);
                 self.collab.presence.remove(&id);
+                self.collab_release_locks(id);
             }
             CollabEvent::Presence { peer, presence } => {
                 self.collab.presence.insert(peer, presence);
             }
-            CollabEvent::Message(_) => {
-                // Replicated ops and snapshots are applied in a later phase.
-            }
+            CollabEvent::Snapshot { author, doc, bytes } => self.collab_on_snapshot(author, doc, &bytes),
+            CollabEvent::Patch { author, doc, rev, bytes } => self.collab_on_patch(author, doc, rev, &bytes),
+            CollabEvent::Message(wire) => self.collab_on_wire(&wire),
             CollabEvent::Error(msg) => self.collab.error = Some(msg),
             CollabEvent::Stopped => self.collab.reset(),
+        }
+    }
+
+    /// A control message from a peer: layer-ownership changes and user notices.
+    fn collab_on_wire(&mut self, wire: &collab::Wire) {
+        match wire {
+            collab::Wire::LockChanged { layer, owner } => match owner {
+                Some(peer) => {
+                    self.collab.locks.insert(*layer, *peer);
+                }
+                None => {
+                    self.collab.locks.remove(layer);
+                }
+            },
+            collab::Wire::Notice { reason } => self.collab.error = Some(reason.clone()),
+            _ => {}
+        }
+    }
+
+    /// A full document arrived. On a guest it is the host's authoritative copy; on the host it is
+    /// a guest's structural change the host adopts and rebroadcasts.
+    fn collab_on_snapshot(&mut self, author: u64, doc: u64, bytes: &[u8]) {
+        if self.collab.role.is_host() {
+            if author != 0 {
+                self.collab_host_adopt_snapshot(author, doc, bytes);
+            }
+        } else {
+            self.collab_apply_snapshot(bytes);
+        }
+    }
+
+    /// A document patch arrived. On a guest it is the host's edit; on the host it is a guest's
+    /// edit to existing layers, which the host checks against the locks, applies and rebroadcasts.
+    fn collab_on_patch(&mut self, author: u64, doc: u64, rev: u64, bytes: &[u8]) {
+        if self.collab.role.is_host() {
+            if author != 0 {
+                self.collab_host_apply_guest_patch(author, doc, rev, bytes);
+            }
+        } else {
+            self.collab_apply_patch(bytes);
+        }
+    }
+
+    /// Send the shared document to a newly joined guest (host only). No-op off-session or when
+    /// the host has no shared document or no transport.
+    fn collab_send_snapshot_to(&mut self, peer: u64) {
+        if !self.collab.role.is_host() {
+            return;
+        }
+        if let Some((doc, bytes)) = self.collab_snapshot_for_shared() {
+            let _ = self.collab_request(collab::CollabRequest::SendSnapshot { peer, doc, bytes });
+        }
+    }
+
+    /// The shared document serialized as a `.pcraft` bundle, and its id (host side).
+    fn collab_snapshot_for_shared(&self) -> Option<(u64, Vec<u8>)> {
+        let id = self.collab.shared?;
+        let st = self.docs.iter().find(|st| st.doc.id == id)?;
+        let bytes = photocraft_format::save_to_bytes(&st.doc, &photocraft_format::SaveOptions::default()).ok()?;
+        Some((id.0, bytes))
+    }
+
+    /// After a committed edit to the shared document, ship it to the other peers: the host
+    /// broadcasts to its guests, a guest sends to the host. Cheap and a no-op off-session.
+    fn collab_broadcast_docs(&mut self, before: &Document, after: &Document) {
+        let Some(shared) = self.collab.shared else { return };
+        if after.id != shared {
+            return;
+        }
+        if self.collab.role.is_host() {
+            self.collab_host_broadcast(shared, before, after);
+        } else if !self.collab.role.is_off() {
+            self.collab_guest_send(shared, before, after);
+        }
+    }
+
+    /// Host: ship an edit to the guests — a minimal layer patch when only existing layers
+    /// changed, otherwise a full snapshot.
+    fn collab_host_broadcast(&mut self, shared: photocraft_doc::DocId, before: &Document, after: &Document) {
+        match crate::layer_multi_cmds::changed_layers(before, after) {
+            Some(layers) if layers.is_empty() => {}
+            Some(layers) => {
+                if let Some(bytes) = serialize_layer_patch(after, layers) {
+                    self.collab.next_seq = self.collab.next_seq.wrapping_add(1);
+                    let rev = self.collab.next_seq;
+                    let _ = self.collab_request(collab::CollabRequest::SendPatch { doc: shared.0, rev, bytes });
+                }
+            }
+            None => {
+                let Some((doc, bytes)) = self.collab_snapshot_for_shared() else { return };
+                let peers: Vec<u64> = self.collab.peers.iter().map(|p| p.id).filter(|id| *id != self.collab.self_id).collect();
+                for peer in peers {
+                    let _ = self.collab_request(collab::CollabRequest::SendSnapshot { peer, doc, bytes: bytes.clone() });
+                }
+            }
+        }
+    }
+
+    /// Guest: send a local edit to the host — a patch for existing layers, or the whole document
+    /// (which the host adopts and rebroadcasts) after a structural change.
+    fn collab_guest_send(&mut self, shared: photocraft_doc::DocId, before: &Document, after: &Document) {
+        match crate::layer_multi_cmds::changed_layers(before, after) {
+            Some(layers) if layers.is_empty() => {}
+            Some(layers) => {
+                if let Some(bytes) = serialize_layer_patch(after, layers) {
+                    let _ = self.collab_request(collab::CollabRequest::SendPatch { doc: shared.0, rev: 0, bytes });
+                }
+            }
+            None => {
+                let Some((doc, bytes)) = self.collab_snapshot_for_shared() else { return };
+                let _ = self.collab_request(collab::CollabRequest::SendSnapshot { peer: 0, doc, bytes });
+            }
+        }
+    }
+
+    /// Host: a guest edited existing layers. Refuse it when another artist owns one of them
+    /// (resyncing the author), otherwise grant the locks, apply it and rebroadcast.
+    fn collab_host_apply_guest_patch(&mut self, author: u64, doc: u64, _rev: u64, bytes: &[u8]) {
+        let Ok(patch) = photocraft_format::load_from_bytes(bytes) else {
+            self.collab_notice_to(author, "a shared patch could not be read");
+            return;
+        };
+        let changed: Vec<u64> = patch.layers.iter().map(|l| l.id.0).collect();
+        if let Some(&layer) = changed.iter().find(|l| self.collab.locks.get(*l).is_some_and(|owner| *owner != author && *owner != 0)) {
+            self.collab_notice_to(author, &format!("another artist is editing that layer (layer {layer})"));
+            self.collab_send_snapshot_to(author);
+            return;
+        }
+        let mut granted = Vec::new();
+        for layer in &changed {
+            if self.collab.locks.get(layer) != Some(&author) {
+                self.collab.locks.insert(*layer, author);
+                granted.push(*layer);
+            }
+        }
+        self.collab_apply_patch(bytes);
+        self.collab.next_seq = self.collab.next_seq.wrapping_add(1);
+        let rev = self.collab.next_seq;
+        let _ = self.collab_request(collab::CollabRequest::SendPatch { doc, rev, bytes: bytes.to_vec() });
+        for layer in granted {
+            let _ = self.collab_request(collab::CollabRequest::Send(collab::Wire::LockChanged { layer, owner: Some(author) }));
+        }
+    }
+
+    /// Host: adopt a guest's full document (a structural change the host could not express as a
+    /// patch) and rebroadcast it to the other guests.
+    fn collab_host_adopt_snapshot(&mut self, author: u64, doc: u64, bytes: &[u8]) {
+        let Ok(newdoc) = photocraft_format::load_from_bytes(bytes) else {
+            self.collab_notice_to(author, "a shared document could not be read");
+            return;
+        };
+        let id = newdoc.id;
+        if let Some(st) = self.docs.iter_mut().find(|st| st.doc.id == id) {
+            st.doc = Arc::new(newdoc);
+            st.revision += 1;
+            st.last_damage = None;
+            fix_active(st);
+            self.collab.shared = Some(id);
+        } else {
+            let index = self.add_document(newdoc, None);
+            self.collab.shared = self.docs.get(index).map(|st| st.doc.id);
+        }
+        let peers: Vec<u64> = self.collab.peers.iter().map(|p| p.id).filter(|id| *id != author && *id != self.collab.self_id).collect();
+        for peer in peers {
+            let _ = self.collab_request(collab::CollabRequest::SendSnapshot { peer, doc, bytes: bytes.to_vec() });
+        }
+    }
+
+    /// Send a short user notice to one peer.
+    fn collab_notice_to(&mut self, peer: u64, reason: &str) {
+        let _ = self.collab_request(collab::CollabRequest::SendTo { peer, wire: collab::Wire::Notice { reason: reason.to_string() } });
+    }
+
+    /// Host: a peer left; free the layers it owned and tell the others.
+    fn collab_release_locks(&mut self, peer: u64) {
+        if !self.collab.role.is_host() {
+            return;
+        }
+        let layers: Vec<u64> = self.collab.locks.iter().filter(|(_, owner)| **owner == peer).map(|(l, _)| *l).collect();
+        for layer in layers {
+            self.collab.locks.remove(&layer);
+            let _ = self.collab_request(collab::CollabRequest::Send(collab::Wire::LockChanged { layer, owner: None }));
+        }
+    }
+
+    /// Install a full shared document received from the host (guest side): replace the open copy
+    /// with the same id, or open it.
+    fn collab_apply_snapshot(&mut self, bytes: &[u8]) {
+        let Ok(doc) = photocraft_format::load_from_bytes(bytes) else {
+            self.collab.error = Some("the shared document could not be loaded".into());
+            return;
+        };
+        let id = doc.id;
+        if let Some(st) = self.docs.iter_mut().find(|st| st.doc.id == id) {
+            st.doc = Arc::new(doc);
+            st.revision += 1;
+            st.last_damage = None;
+            fix_active(st);
+            self.collab.shared = Some(id);
+        } else {
+            let index = self.add_document(doc, None);
+            self.collab.shared = self.docs.get(index).map(|st| st.doc.id);
+        }
+    }
+
+    /// Apply a layer patch received from the host (guest side): replace the named layers'
+    /// content, leaving the rest of the document untouched.
+    fn collab_apply_patch(&mut self, bytes: &[u8]) {
+        let Ok(patch) = photocraft_format::load_from_bytes(bytes) else {
+            self.collab.error = Some("a shared patch could not be loaded".into());
+            return;
+        };
+        let Some(shared) = self.collab.shared else { return };
+        let Some(st) = self.docs.iter_mut().find(|st| st.doc.id == shared) else { return };
+        let mut doc = (*st.doc).clone();
+        let mut applied = false;
+        for layer in patch.layers {
+            if let Some(slot) = doc.layer_mut(layer.id) {
+                *slot = layer;
+                applied = true;
+            }
+        }
+        if applied {
+            st.doc = Arc::new(doc);
+            st.revision += 1;
+            st.last_damage = None;
         }
     }
 
@@ -772,8 +1002,10 @@ impl Session {
     pub fn edit<R>(&mut self, label: &str, f: impl FnOnce(&mut Document, &mut Option<LayerId>) -> Result<R>) -> Result<R> {
         let restrict = self.color_restrict;
         let sampler_map = self.sampler_map.take();
+        let collab_active = !self.collab.role.is_off();
         let st = self.active_mut().ok_or(EngineError::NoDocument)?;
         let before = st.doc.clone();
+        let collab_before = collab_active.then(|| before.clone());
         // Selecting layers is not a step, so the state this edit leaves behind targets what was
         // selected just before it (#1356): undoing a stroke keeps the painted layer active.
         let prior = st.layer_target();
@@ -831,6 +1063,12 @@ impl Session {
             // Free the mask early; a stale entry would only miss (it is keyed by pixels).
             self.subject_cache = Default::default();
             self.object_finder = Default::default();
+        }
+        if let (true, Some(before)) = (collab_active, collab_before) {
+            let after = self.active().map(|st| st.doc.clone());
+            if let Some(after) = after {
+                self.collab_broadcast_docs(&before, &after);
+            }
         }
         Ok(r)
     }
@@ -902,47 +1140,51 @@ impl Session {
         if self.active_job().is_some() {
             return false;
         }
+        let collab_active = !self.collab.role.is_off();
         let Some(st) = self.active_mut() else { return false };
         st.coalesce = None;
-        match st.history.undo(st.doc.clone()) {
-            Some((mut d, layers)) => {
-                // Save As changes file identity outside history, just like the saved path.
-                if d.name != st.doc.name {
-                    Arc::make_mut(&mut d).name.clone_from(&st.doc.name);
-                }
-                // Pixels this step can have touched, so the canvas recomposites only that
-                // (it recomposited everything before).
-                let damage = layer_multi_cmds::step_damage(&d, &st.doc);
-                st.doc = d;
-                restore_target(st, layers);
-                st.revision += 1;
-                st.last_damage = damage;
-                true
-            }
-            None => false,
+        let Some((mut d, layers)) = st.history.undo(st.doc.clone()) else { return false };
+        // Save As changes file identity outside history, just like the saved path.
+        if d.name != st.doc.name {
+            Arc::make_mut(&mut d).name.clone_from(&st.doc.name);
         }
+        // Pixels this step can have touched, so the canvas recomposites only that
+        // (it recomposited everything before).
+        let damage = layer_multi_cmds::step_damage(&d, &st.doc);
+        let before = st.doc.clone();
+        st.doc = d;
+        restore_target(st, layers);
+        st.revision += 1;
+        st.last_damage = damage;
+        let after = st.doc.clone();
+        if collab_active {
+            self.collab_broadcast_docs(&before, &after);
+        }
+        true
     }
 
     pub fn redo(&mut self) -> bool {
         if self.active_job().is_some() {
             return false;
         }
+        let collab_active = !self.collab.role.is_off();
         let Some(st) = self.active_mut() else { return false };
         st.coalesce = None;
-        match st.history.redo(st.doc.clone()) {
-            Some((mut d, layers)) => {
-                if d.name != st.doc.name {
-                    Arc::make_mut(&mut d).name.clone_from(&st.doc.name);
-                }
-                let damage = layer_multi_cmds::step_damage(&st.doc, &d);
-                st.doc = d;
-                restore_target(st, layers);
-                st.revision += 1;
-                st.last_damage = damage;
-                true
-            }
-            None => false,
+        let Some((mut d, layers)) = st.history.redo(st.doc.clone()) else { return false };
+        if d.name != st.doc.name {
+            Arc::make_mut(&mut d).name.clone_from(&st.doc.name);
         }
+        let damage = layer_multi_cmds::step_damage(&st.doc, &d);
+        let before = st.doc.clone();
+        st.doc = d;
+        restore_target(st, layers);
+        st.revision += 1;
+        st.last_damage = damage;
+        let after = st.doc.clone();
+        if collab_active {
+            self.collab_broadcast_docs(&before, &after);
+        }
+        true
     }
 }
 
@@ -990,6 +1232,16 @@ pub(crate) fn fix_selection(st: &mut DocState) {
     if st.layer_anchor.is_some_and(|a| !st.selected_layers.contains(&a)) {
         st.layer_anchor = Some(active);
     }
+}
+
+/// Serialize a set of changed layers as a small `.pcraft` bundle (tiles shared, so cloning the
+/// layers is cheap) for a cooperative-working patch. `None` if serialization fails.
+fn serialize_layer_patch(source: &Document, layers: Vec<photocraft_doc::Layer>) -> Option<Vec<u8>> {
+    let mut patch = Document::new(source.name.clone(), source.size, source.mode, source.depth);
+    patch.icc_profile = source.icc_profile.clone();
+    patch.resolution_dpi = source.resolution_dpi;
+    patch.layers = layers;
+    photocraft_format::save_to_bytes(&patch, &photocraft_format::SaveOptions::default()).ok()
 }
 
 #[cfg(test)]

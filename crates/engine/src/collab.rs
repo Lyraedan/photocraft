@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 
+use photocraft_doc::DocId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -47,6 +48,11 @@ impl CollabRole {
 
     pub fn is_off(&self) -> bool {
         matches!(self, Self::Off)
+    }
+
+    /// Whether this peer hosts the session.
+    pub fn is_host(&self) -> bool {
+        matches!(self, Self::Host { .. })
     }
 }
 
@@ -112,6 +118,10 @@ pub enum Wire {
     Op { op: CollabOp },
     /// The host's verdict on an op a peer offered.
     OpResult { seq: u64, ok: bool },
+    /// The layer's ownership changed: `owner` is the peer editing it, or `None` when it is free.
+    LockChanged { layer: u64, owner: Option<u64> },
+    /// A short message for the user (a refused edit, a lock conflict, …).
+    Notice { reason: String },
     /// Keepalive.
     Ping,
     /// Keepalive reply.
@@ -140,6 +150,14 @@ pub enum CollabRequest {
     Leave,
     /// Send a message to the host (guest) or broadcast it to the guests (host).
     Send(Wire),
+    /// Send a full document snapshot to one peer; sent as a binary frame because the image is
+    /// large. A host sends one to a joining guest; a guest sends one to the host after a
+    /// structural change the host must adopt.
+    SendSnapshot { peer: u64, doc: u64, bytes: Vec<u8> },
+    /// Broadcast a document patch to every peer (host). `rev` is the host's op sequence.
+    SendPatch { doc: u64, rev: u64, bytes: Vec<u8> },
+    /// Send a control message to one peer.
+    SendTo { peer: u64, wire: Wire },
 }
 
 /// An event from the `netcode` transport thread to the session.
@@ -157,7 +175,12 @@ pub enum CollabEvent {
     PeerLeft(u64),
     /// A peer's presence changed.
     Presence { peer: u64, presence: Presence },
-    /// Any other wire message the transport forwards unchanged (ops, snapshots, …).
+    /// A full document arrived: from the host to a peer after joining or a structural change; or
+    /// from a guest to the host after a structural change the guest made.
+    Snapshot { author: u64, doc: u64, bytes: Vec<u8> },
+    /// A document patch arrived: the sender's changes to a set of existing layers.
+    Patch { author: u64, doc: u64, rev: u64, bytes: Vec<u8> },
+    /// Any other wire message the transport forwards unchanged (edits, …).
     Message(Box<Wire>),
     /// A transport-level problem (bind/connect/handshake/read failure).
     Error(String),
@@ -188,6 +211,15 @@ pub struct CollabState {
     pub presence: BTreeMap<u64, Presence>,
     /// The last error the transport reported, for the status bar and inspection.
     pub error: Option<String>,
+    /// How far the join/host handshake has got: false while starting (or off), true once the
+    /// transport confirmed it (`Hosting` / `Joined`). Drives the dialogs.
+    pub ready: bool,
+    /// The one shared document (the host's on the host, the received copy on a guest).
+    pub shared: Option<DocId>,
+    /// Host side: the next patch sequence number.
+    pub next_seq: u64,
+    /// Layer ownership: layer id → the peer editing it (host-side authority, mirrored on guests).
+    pub locks: BTreeMap<u64, u64>,
 }
 
 impl CollabState {

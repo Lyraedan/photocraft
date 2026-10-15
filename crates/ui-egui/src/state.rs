@@ -1297,12 +1297,20 @@ pub struct UiState {
     pub camera_raw_scope: CameraRawScopeState,
     #[serde(default)]
     pub camera_raw_preview: CameraRawPreviewState,
+    /// The open Collaborate (Share… / Connect…) dialog. Transient: never saved or restored.
+    #[serde(skip)]
+    pub collab_dialog: Option<crate::collab_ui::CollabDialog>,
+    /// The last Collaborate inputs (name, IP, port, address), remembered across opens and restarts.
+    #[serde(default)]
+    pub collab_inputs: crate::collab_ui::CollabInputs,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
             tool: Tool::Brush,
+            collab_dialog: None,
+            collab_inputs: Default::default(),
             group_tools: Vec::new(),
             spring: None,
             recent_files: Vec::new(),

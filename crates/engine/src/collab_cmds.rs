@@ -56,7 +56,11 @@ fn host(s: &mut Session, p: &Value) -> Result<Value> {
     let name = display_name(p, "Host");
     s.collab_request(CollabRequest::Host { listen: listen.clone(), passphrase, name })?;
     s.collab.role = CollabRole::Host { addr: listen.clone() };
+    s.collab.ready = false;
     s.collab.error = None;
+    // The active document becomes the one shared with the guests.
+    let shared = s.active().map(|st| st.doc.id);
+    s.collab.shared = shared;
     Ok(json!({ "role": "host", "listen": listen }))
 }
 
@@ -66,7 +70,10 @@ fn join(s: &mut Session, p: &Value) -> Result<Value> {
     let name = display_name(p, "Artist");
     s.collab_request(CollabRequest::Join { addr: addr.clone(), passphrase, name })?;
     s.collab.role = CollabRole::Guest { addr: addr.clone() };
+    s.collab.ready = false;
     s.collab.error = None;
+    // The shared document arrives from the host (as a snapshot) after the handshake.
+    s.collab.shared = None;
     Ok(json!({ "role": "guest", "addr": addr }))
 }
 
@@ -144,8 +151,9 @@ pub fn specs() -> Vec<CommandSpec> {
             run: join,
             journal: false,
         },
-        // Leaving is always allowed: with no session it is a harmless no-op.
-        CommandSpec { id: "collab.leave", label: "Leave Session", menu: &[], shortcut: NOW, params: r##"{}"##, enabled: |_| Ok(()), run: leave, journal: false },
+        // Leaving and listing peers need an active session: both are greyed out when off, so the
+        // menu does not offer to leave a session that does not exist.
+        CommandSpec { id: "collab.leave", label: "Leave Session", menu: &["Collaborate"], shortcut: NOW, params: r##"{}"##, enabled: active, run: leave, journal: false },
         CommandSpec {
             id: "collab.presence",
             label: "Publish Presence",
@@ -156,7 +164,7 @@ pub fn specs() -> Vec<CommandSpec> {
             run: presence,
             journal: false,
         },
-        CommandSpec { id: "collab.peers", label: "Session Peers", menu: &[], shortcut: NOW, params: r##"{}"##, enabled: |_| Ok(()), run: peers, journal: false },
+        CommandSpec { id: "collab.peers", label: "Session Peers", menu: &["Collaborate"], shortcut: NOW, params: r##"{}"##, enabled: active, run: peers, journal: false },
     ]
 }
 
@@ -189,8 +197,9 @@ mod tests {
         let mut s = Session::new();
         assert!(s.execute("collab.host", json!({"passphrase": "x"})).is_err());
         assert!(s.execute("collab.join", json!({"addr": "h:1", "passphrase": "x"})).is_err());
-        assert!(s.execute("collab.peers", json!({})).is_ok());
-        assert!(s.execute("collab.leave", json!({})).is_ok());
+        // Peers and leave need a session: both are disabled off-session (they return Err).
+        assert!(s.execute("collab.peers", json!({})).is_err());
+        assert!(s.execute("collab.leave", json!({})).is_err());
     }
 
     #[test]
@@ -231,6 +240,7 @@ mod tests {
         let mut s = Session::new();
         s.collab_receive(CollabEvent::Hosting { addr: "127.0.0.1:9".into() });
         assert_eq!(s.collab.role, CollabRole::Host { addr: "127.0.0.1:9".into() });
+        assert!(s.collab.ready, "Hosting marks the session ready");
         s.collab_receive(CollabEvent::PeerJoined(PeerInfo { id: 1, name: "Bo".into(), color: 1 }));
         assert_eq!(s.collab.peers.len(), 1);
         s.collab_receive(CollabEvent::Presence { peer: 1, presence: Presence { cursor: Some([5.0, 6.0]), ..Default::default() } });
@@ -239,7 +249,7 @@ mod tests {
         assert!(s.collab.peers.is_empty() && s.collab.presence.is_empty());
         // A rejected join clears the session but keeps the reason for the status bar.
         s.collab_receive(CollabEvent::Rejected { reason: "wrong passphrase".into() });
-        assert!(!s.collab.is_active());
+        assert!(!s.collab.is_active() && !s.collab.ready, "a rejection returns to the off state");
         assert_eq!(s.collab.error.as_deref(), Some("wrong passphrase"));
     }
 }

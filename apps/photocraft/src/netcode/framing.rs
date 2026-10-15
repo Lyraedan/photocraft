@@ -1,8 +1,9 @@
 //! Length-prefixed frames over a TCP stream.
 //!
 //! Layout: one kind byte, a little-endian `u32` payload length, then the payload. JSON messages
-//! use [`KIND_JSON`]; large binary payloads (the document snapshot, in a later phase) get their
-//! own kind so JSON never has to carry base64.
+//! use [`KIND_JSON`]; document snapshots and patches use [`KIND_BLOB`], whose payload is a
+//! little-endian `u32` header length, a JSON header, then the raw bytes — so an image never has
+//! to be base64-expanded inside JSON.
 //!
 //! Every read is bounded: a peer cannot make the app allocate an unbounded buffer. A read timeout
 //! on the socket lets a reader notice shutdown between frames; a timeout *inside* a frame is
@@ -15,8 +16,13 @@ use photocraft_engine::collab::Wire;
 
 /// A JSON-encoded [`Wire`] message.
 pub const KIND_JSON: u8 = 1;
-/// Maximum size of a JSON frame (presence, ops, handshake).
+/// A binary frame (`u32` header length ‖ JSON header ‖ bytes): a document snapshot or patch.
+pub const KIND_BLOB: u8 = 2;
+/// Maximum size of a JSON frame (presence, handshake).
 pub const MAX_JSON: usize = 4 << 20;
+/// Maximum size of a binary frame (a serialized document or patch). Bounded so a hostile peer
+/// cannot exhaust memory.
+pub const MAX_BLOB: usize = 1 << 30;
 
 /// Write one frame and flush it.
 pub fn write_frame<W: Write>(w: &mut W, kind: u8, payload: &[u8]) -> io::Result<()> {
@@ -33,19 +39,29 @@ pub fn write_json<W: Write>(w: &mut W, value: &Wire) -> io::Result<()> {
     write_frame(w, KIND_JSON, &bytes)
 }
 
-/// Read one JSON frame. `Ok(None)` on clean EOF or shutdown; an error on a malformed or
-/// oversized frame. A would-block/timed-out read is retried until `shutdown` is set, so an idle
-/// connection can be closed promptly without ever truncating a frame.
-pub fn read_json<R: Read>(r: &mut R, shutdown: &AtomicBool) -> io::Result<Option<Wire>> {
-    let Some((kind, payload)) = read_frame(r, shutdown)? else { return Ok(None) };
-    if kind != KIND_JSON {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected frame kind {kind}")));
-    }
-    serde_json::from_slice(&payload).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+/// Write one binary frame: a JSON `header` and the raw `data`.
+pub fn write_blob<W: Write>(w: &mut W, header: &[u8], data: &[u8]) -> io::Result<()> {
+    let header_len = u32::try_from(header.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "blob header too large"))?;
+    let mut payload = Vec::with_capacity(4 + header.len() + data.len());
+    payload.extend_from_slice(&header_len.to_le_bytes());
+    payload.extend_from_slice(header);
+    payload.extend_from_slice(data);
+    write_frame(w, KIND_BLOB, &payload)
 }
 
-/// Read one frame, bounding the payload by [`MAX_JSON`].
-fn read_frame<R: Read>(r: &mut R, shutdown: &AtomicBool) -> io::Result<Option<(u8, Vec<u8>)>> {
+/// Read one JSON frame. `Ok(None)` on clean EOF or shutdown.
+pub fn read_json<R: Read>(r: &mut R, shutdown: &AtomicBool) -> io::Result<Option<Wire>> {
+    match read_frame(r, shutdown, MAX_JSON)? {
+        None => Ok(None),
+        Some((KIND_JSON, payload)) => serde_json::from_slice(&payload).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        Some((kind, _)) => Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected frame kind {kind}"))),
+    }
+}
+
+/// Read one frame of any kind, bounding the payload by `max`. `Ok(None)` on clean EOF or
+/// shutdown; an error on a malformed or oversized frame. A would-block/timed-out read is retried
+/// until `shutdown` is set, so an idle connection can close promptly without truncating a frame.
+pub fn read_frame<R: Read>(r: &mut R, shutdown: &AtomicBool, max: usize) -> io::Result<Option<(u8, Vec<u8>)>> {
     let mut kind = [0u8; 1];
     loop {
         match r.read(&mut kind) {
@@ -62,8 +78,8 @@ fn read_frame<R: Read>(r: &mut R, shutdown: &AtomicBool) -> io::Result<Option<(u
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes)?;
     let len = u32::from_le_bytes(len_bytes) as usize;
-    if len > MAX_JSON {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("frame of {len} bytes exceeds the {MAX_JSON}-byte limit")));
+    if len > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("frame of {len} bytes exceeds the {max}-byte limit")));
     }
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
@@ -86,12 +102,27 @@ mod tests {
     }
 
     #[test]
+    fn blob_frame_round_trips_with_header_and_data() {
+        let mut buf = Vec::new();
+        write_blob(&mut buf, br#"{"kind":"snapshot","doc":7,"rev":0}"#, b"\x00\x01\x02binary").unwrap();
+        let shutdown = AtomicBool::new(false);
+        let mut cursor = std::io::Cursor::new(buf);
+        let (kind, payload) = read_frame(&mut cursor, &shutdown, MAX_BLOB).unwrap().unwrap();
+        assert_eq!(kind, KIND_BLOB);
+        let header_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        let header = &payload[4..4 + header_len];
+        let data = &payload[4 + header_len..];
+        assert_eq!(header, br#"{"kind":"snapshot","doc":7,"rev":0}"#);
+        assert_eq!(data, b"\x00\x01\x02binary");
+    }
+
+    #[test]
     fn oversized_declared_length_is_rejected_without_allocating() {
         let mut buf = vec![KIND_JSON];
         buf.extend_from_slice(&u32::MAX.to_le_bytes());
         let shutdown = AtomicBool::new(false);
         let mut cursor = std::io::Cursor::new(buf);
-        assert!(read_json(&mut cursor, &shutdown).is_err());
+        assert!(read_frame(&mut cursor, &shutdown, MAX_JSON).is_err());
     }
 
     #[test]
@@ -117,7 +148,7 @@ mod tests {
 
     #[test]
     fn nonzero_frame_round_trips_through_the_same_path() {
-        // A gossip of messages in one stream keeps its order and boundaries.
+        // A stream of messages keeps its order and boundaries.
         let messages = vec![Wire::Ping, Wire::PeerJoined { peer: PeerInfo { id: 1, name: "a".into(), color: 0xabcdef } }, Wire::Pong];
         let mut buf = Vec::new();
         for m in &messages {

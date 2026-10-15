@@ -1,4 +1,4 @@
-//! The guest side: connect, authenticate, then receive relayed messages from the host.
+//! The guest side: connect, authenticate, then receive the shared document and the host's edits.
 
 use std::io::BufReader;
 use std::net::TcpStream;
@@ -7,7 +7,7 @@ use std::sync::mpsc::channel;
 
 use photocraft_engine::collab::{CollabEvent, PROTOCOL, Wire, auth_proof};
 
-use super::{Hub, conn, framing};
+use super::{Hub, Incoming, Out, conn, framing, read_in};
 
 /// Spawn the connector thread. It reports `Joined` on success or `Rejected`/`Error` otherwise.
 pub(crate) fn spawn(hub: Arc<Hub>, addr: String, name: String) {
@@ -70,7 +70,7 @@ pub(crate) fn spawn(hub: Arc<Hub>, addr: String, name: String) {
         };
         hub.set_self_info(peer.clone());
         hub.set_session(session.clone());
-        let (wtx, wrx) = channel::<Wire>();
+        let (wtx, wrx) = channel::<Out>();
         conn::spawn_writer(writer, wrx);
         hub.set_host_link(wtx.clone());
         hub.event(CollabEvent::Joined { self_info: peer.clone(), session });
@@ -81,19 +81,21 @@ pub(crate) fn spawn(hub: Arc<Hub>, addr: String, name: String) {
         }
 
         loop {
-            match framing::read_json(&mut reader, &hub.shutdown) {
-                Ok(Some(Wire::Ping)) => {
-                    let _ = wtx.send(Wire::Pong);
+            match read_in(&mut reader, &hub.shutdown) {
+                Ok(Some(Incoming::Wire(Wire::Ping))) => {
+                    let _ = wtx.send(Out::Wire(Wire::Pong));
                 }
-                Ok(Some(Wire::Pong)) => {}
-                Ok(Some(Wire::Bye { reason })) => {
+                Ok(Some(Incoming::Wire(Wire::Pong))) => {}
+                Ok(Some(Incoming::Wire(Wire::Bye { reason }))) => {
                     hub.event(CollabEvent::Error(format!("the host left the session: {reason}")));
                     break;
                 }
-                Ok(Some(Wire::PeerJoined { peer })) => hub.event(CollabEvent::PeerJoined(peer)),
-                Ok(Some(Wire::PeerLeft { peer })) => hub.event(CollabEvent::PeerLeft(peer)),
-                Ok(Some(Wire::Presence { peer, presence })) => hub.event(CollabEvent::Presence { peer, presence }),
-                Ok(Some(wire)) => hub.event(CollabEvent::Message(Box::new(wire))),
+                Ok(Some(Incoming::Wire(Wire::PeerJoined { peer }))) => hub.event(CollabEvent::PeerJoined(peer)),
+                Ok(Some(Incoming::Wire(Wire::PeerLeft { peer }))) => hub.event(CollabEvent::PeerLeft(peer)),
+                Ok(Some(Incoming::Wire(Wire::Presence { peer, presence }))) => hub.event(CollabEvent::Presence { peer, presence }),
+                Ok(Some(Incoming::Wire(wire))) => hub.event(CollabEvent::Message(Box::new(wire))),
+                Ok(Some(Incoming::Snapshot { doc, bytes })) => hub.event(CollabEvent::Snapshot { author: 0, doc, bytes }),
+                Ok(Some(Incoming::Patch { doc, rev, bytes })) => hub.event(CollabEvent::Patch { author: 0, doc, rev, bytes }),
                 Ok(None) => break,
                 Err(_) => break,
             }
